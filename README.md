@@ -38,40 +38,40 @@ Total elapsed time from failure to traffic-on-DR: **under 5 minutes**. Total eng
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            DEVELOPER WORKFLOW                               │
-│  git push → Jenkins CI → Docker build → ECR push → Git commit (image tag)  │
-│                                              ↓                              │
-│                                   ArgoCD syncs both clusters                │
-└────────────────────────────────────────────────┬────────────────────────────┘
-                                                 │
-              ┌──────────────────────────────────┼──────────────────────────┐
-              │                                  │                          │
-              ▼                                  ▼                          │
-┌─────────────────────────────┐    ┌─────────────────────────────────────┐  │
-│  us-east-1  —  PRIMARY      │    │        us-west-2  —  DR STANDBY     │  │
-│                             │    │                                     │  │
-│  EKS 1.30  (2–4 nodes)      │    │  EKS 1.30  (1 node → 3 on failover)│  │
-│  ┌─────────────────────┐    │    │  ┌──────────────────────────────┐  │  │
-│  │  dr-status-monitor  │    │    │  │  dr-status-monitor (ArgoCD)  │  │  │
-│  │  Prometheus+Grafana │    │    │  │  Prometheus + Grafana        │  │  │
-│  │  OpenSearch+FluentBit    │    │  │  OpenSearch + Fluent Bit     │  │  │
-│  │  Velero  (hourly)   │    │    │  │  Velero  (receives replica)  │  │  │
-│  │  ArgoCD             │    │    │  └──────────────────────────────┘  │  │
-│  │  OPA Gatekeeper     │    │    │                                     │  │
-│  │  Drift Detection    │    │    │  RDS PostgreSQL 16                  │  │
-│  └─────────────────────┘    │    │  Read Replica  ──► Promoted         │  │
-│                             │    │  on failover   (WAL lag < 1s)       │  │
-│  RDS PostgreSQL 16          │WAL │                                     │  │
-│  Multi-AZ primary       ────┼───►│  S3 Velero Bucket                   │  │
-│                             │CRR │  (receives cross-region replicas)   │  │
-│  S3 Velero Bucket       ────┼───►└─────────────────────────────────────┘  │
-│                             │                        ▲                     │
-│  Lambda Failover Handler    │               ArgoCD sync (same Git repo)    │
-│  EventBridge Rule           │                                              │
-│  Route 53 Health Check ─────┼──── /health HTTP check every 10s ───────────┘
-│  AWS Config + CloudWatch    │     3 failures = ALARM → Lambda fires
-└─────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                             DEVELOPER WORKFLOW                               │
+│   git push → Jenkins CI → Docker build → ECR push → Git commit (image tag)  │
+│                                               ↓                             │
+│                                    ArgoCD syncs both clusters               │
+└─────────────────────────────────────────────────┬───────────────────────────┘
+                                                  │
+               ┌──────────────────────────────────┼───────────────────────┐
+               │                                  │                       │
+               ▼                                  ▼                       │
+┌──────────────────────────────┐    ┌──────────────────────────────────┐  │
+│   us-east-1  —  PRIMARY      │    │     us-west-2  —  DR STANDBY     │  │
+│                              │    │                                  │  │
+│   EKS 1.30  (2-4 nodes)      │    │  EKS 1.30 (1 node→3 on failover) │  │
+│   ┌──────────────────────┐   │    │  ┌──────────────────────────┐   │  │
+│   │  dr-status-monitor   │   │    │  │ dr-status-monitor        │   │  │
+│   │  Prometheus + Grafana│   │    │  │ Prometheus + Grafana     │   │  │
+│   │  OpenSearch + Fluent │   │    │  │ OpenSearch + Fluent Bit  │   │  │
+│   │  Velero  (hourly)    │   │    │  │ Velero (receives replica)│   │  │
+│   │  ArgoCD              │   │    │  └──────────────────────────┘   │  │
+│   │  OPA Gatekeeper      │   │    │                                  │  │
+│   │  Drift Detection     │   │    │  RDS PostgreSQL 16               │  │
+│   └──────────────────────┘   │    │  Read Replica ──► Promoted       │  │
+│                              │    │  on failover  (WAL lag < 1s)     │  │
+│   RDS PostgreSQL 16     WAL  │    │                                  │  │
+│   Multi-AZ primary  ────────►│    │  S3 Velero Bucket                │  │
+│                         CRR  │    │  (receives CRR replicas)         │  │
+│   S3 Velero Bucket  ────────►└────┴──────────────────────────────────┘  │
+│                              │                       ▲                  │
+│   Lambda Failover Handler    │              ArgoCD sync (same Git repo) │
+│   EventBridge Rule           │                                          │
+│   Route 53 Health Check ─────┼─── /health every 10s ───────────────────┘
+│   AWS Config + CloudWatch    │    3 failures = ALARM → Lambda fires
+└──────────────────────────────┘
 ```
 
 **Automated failover chain:**
