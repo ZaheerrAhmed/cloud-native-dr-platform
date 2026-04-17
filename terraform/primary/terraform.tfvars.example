@@ -1,0 +1,29 @@
+# ============================================================
+# terraform.tfvars.example
+# Copy this file to terraform.tfvars and fill in your values.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# terraform.tfvars is in .gitignore — it will NEVER be committed.
+# This .example file has fake values — safe to commit.
+# ============================================================
+
+# Your 12-digit AWS account number
+# Get it: aws sts get-caller-identity --query Account --output text
+aws_account_id = "123456789012"
+
+# Route 53 Hosted Zone ID for your domain
+# Get it: AWS Console → Route 53 → Hosted zones → copy the ID (looks like Z1ABC2DEF3GHI)
+# If you have no domain yet, leave as "PLACEHOLDER" — Route53 features won't work but everything else will
+hosted_zone_id = "Z1ABC2DEF3GHI"
+
+# Your domain name (must exist in the hosted zone above)
+# If no domain: use "app.example.com" — app will still work via ALB URL
+domain_name = "app.yourdomain.com"
+
+# Email address for DR failover alerts (SNS will send here)
+alert_emails = ["zaheer.noor210@gmail.com"]
+
+# IP address of your Jenkins server (so kubectl can connect to EKS)
+# Use "0.0.0.0/0" to allow from anywhere (ok for exam, not for production)
+jenkins_ip = "0.0.0.0/0"

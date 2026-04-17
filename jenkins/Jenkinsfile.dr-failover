@@ -1,0 +1,162 @@
+// ============================================================
+// DR Failover Pipeline — triggered manually or by CloudWatch alarm
+// Stages: Verify Primary Down → Promote RDS → Scale EKS DR
+//         → Restore Velero Backup → Validate → Notify
+// ============================================================
+
+pipeline {
+    agent { label 'docker' }
+
+    parameters {
+        choice(name: 'FAILOVER_TYPE',  choices: ['AUTOMATIC', 'MANUAL_DRILL', 'MANUAL_EMERGENCY'], description: 'Reason for failover')
+        booleanParam(name: 'PROMOTE_RDS',     defaultValue: true,  description: 'Promote RDS read replica')
+        booleanParam(name: 'SCALE_EKS',       defaultValue: true,  description: 'Scale up DR EKS nodes')
+        booleanParam(name: 'RESTORE_VELERO',  defaultValue: false, description: 'Restore latest Velero backup (only if EKS state is lost)')
+        string(name: 'VELERO_BACKUP_NAME',    defaultValue: 'latest', description: 'Velero backup name to restore (or "latest")')
+    }
+
+    environment {
+        AWS_REGION_PRIMARY = 'us-east-1'
+        AWS_REGION_DR      = 'us-west-2'
+        DR_EKS_CLUSTER     = 'dr-platform-dr-eks'
+        DR_EKS_NODEGROUP   = 'dr-platform-dr-eks-workers'
+        DR_RDS_IDENTIFIER  = 'dr-platform-dr-postgres-replica'
+        NAMESPACE          = 'dr-app'
+        SNS_TOPIC_ARN      = credentials('dr-sns-topic-arn')
+    }
+
+    stages {
+
+        stage('Verify Primary Status') {
+            steps {
+                withAWS(region: AWS_REGION_PRIMARY, credentials: 'aws-jenkins-credentials') {
+                    script {
+                        def hcStatus = sh(
+                            script: "aws route53 get-health-check-status --health-check-id \$(aws route53 list-health-checks --query 'HealthChecks[?Name==`dr-platform-primary`].Id' --output text) --query 'HealthCheckObservations[0].StatusReport.Status' --output text",
+                            returnStdout: true
+                        ).trim()
+                        echo "Primary health check status: ${hcStatus}"
+                        if (params.FAILOVER_TYPE == 'MANUAL_DRILL') {
+                            echo "Manual DR drill — proceeding regardless of primary status"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Promote RDS Replica') {
+            when { expression { params.PROMOTE_RDS } }
+            steps {
+                withAWS(region: AWS_REGION_DR, credentials: 'aws-jenkins-credentials') {
+                    sh """
+                        echo "Promoting RDS replica to standalone primary..."
+                        aws rds promote-read-replica \
+                          --db-instance-identifier ${DR_RDS_IDENTIFIER} \
+                          --backup-retention-period 7
+
+                        echo "Waiting for RDS to become available..."
+                        aws rds wait db-instance-available \
+                          --db-instance-identifier ${DR_RDS_IDENTIFIER}
+
+                        echo "RDS replica promoted successfully"
+                        aws rds describe-db-instances \
+                          --db-instance-identifier ${DR_RDS_IDENTIFIER} \
+                          --query 'DBInstances[0].{Status:DBInstanceStatus,Role:ReadReplicaSourceDBInstanceIdentifier}'
+                    """
+                }
+            }
+        }
+
+        stage('Scale Up DR EKS') {
+            when { expression { params.SCALE_EKS } }
+            steps {
+                withAWS(region: AWS_REGION_DR, credentials: 'aws-jenkins-credentials') {
+                    sh """
+                        echo "Scaling up DR EKS node group..."
+                        aws eks update-nodegroup-config \
+                          --cluster-name ${DR_EKS_CLUSTER} \
+                          --nodegroup-name ${DR_EKS_NODEGROUP} \
+                          --scaling-config minSize=2,maxSize=4,desiredSize=3
+
+                        echo "Waiting for nodes to be ready..."
+                        aws eks wait nodegroup-active \
+                          --cluster-name ${DR_EKS_CLUSTER} \
+                          --nodegroup-name ${DR_EKS_NODEGROUP}
+
+                        aws eks update-kubeconfig --region ${AWS_REGION_DR} --name ${DR_EKS_CLUSTER}
+                        kubectl wait --for=condition=Ready nodes --all --timeout=300s
+                        echo "DR EKS cluster ready with \$(kubectl get nodes --no-headers | wc -l) nodes"
+                    """
+                }
+            }
+        }
+
+        stage('Restore Velero Backup') {
+            when { expression { params.RESTORE_VELERO } }
+            steps {
+                withAWS(region: AWS_REGION_DR, credentials: 'aws-jenkins-credentials') {
+                    sh """
+                        aws eks update-kubeconfig --region ${AWS_REGION_DR} --name ${DR_EKS_CLUSTER}
+
+                        BACKUP_NAME=${params.VELERO_BACKUP_NAME}
+                        if [ "\$BACKUP_NAME" = "latest" ]; then
+                            BACKUP_NAME=\$(velero backup get -o json | jq -r '.items | sort_by(.metadata.creationTimestamp) | last | .metadata.name')
+                            echo "Latest backup: \$BACKUP_NAME"
+                        fi
+
+                        velero restore create \
+                          --from-backup \$BACKUP_NAME \
+                          --wait \
+                          --include-namespaces ${NAMESPACE}
+
+                        kubectl get pods -n ${NAMESPACE}
+                        echo "Velero restore completed"
+                    """
+                }
+            }
+        }
+
+        stage('Validate DR Application') {
+            steps {
+                withAWS(region: AWS_REGION_DR, credentials: 'aws-jenkins-credentials') {
+                    sh """
+                        aws eks update-kubeconfig --region ${AWS_REGION_DR} --name ${DR_EKS_CLUSTER}
+
+                        kubectl rollout status deployment/dr-status-monitor \
+                          -n ${NAMESPACE} --timeout=180s
+
+                        DR_LB=\$(kubectl get svc dr-status-monitor-svc -n ${NAMESPACE} \
+                          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+                        sleep 30
+                        STATUS=\$(curl -s -o /dev/null -w "%{http_code}" http://\${DR_LB}/health)
+                        if [ "\$STATUS" = "200" ]; then
+                            echo "DR application HEALTHY — failover successful"
+                        else
+                            echo "DR application returned HTTP \$STATUS — investigate"
+                            exit 1
+                        fi
+                    """
+                }
+            }
+        }
+
+        stage('Notify Teams') {
+            steps {
+                withAWS(region: AWS_REGION_PRIMARY, credentials: 'aws-jenkins-credentials') {
+                    sh """
+                        aws sns publish \
+                          --topic-arn ${SNS_TOPIC_ARN} \
+                          --subject "[DR] Failover Complete — ${params.FAILOVER_TYPE}" \
+                          --message "DR failover pipeline completed successfully. Type: ${params.FAILOVER_TYPE}. DR application is now serving traffic in ${AWS_REGION_DR}. Build: ${BUILD_URL}"
+                    """
+                }
+                slackSend(
+                    channel: '#incidents',
+                    color: params.FAILOVER_TYPE == 'MANUAL_DRILL' ? 'warning' : 'danger',
+                    message: "🔄 *DR Failover Complete* — Type: `${params.FAILOVER_TYPE}`\nDR cluster in `${env.AWS_REGION_DR}` is now active\nBuild: ${BUILD_URL}"
+                )
+            }
+        }
+    }
+}

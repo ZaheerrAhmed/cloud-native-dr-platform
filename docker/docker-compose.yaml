@@ -1,0 +1,65 @@
+# Local development & testing — mirrors the Kubernetes deployment
+# Run: docker compose up --build
+version: "3.9"
+
+services:
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    image: dr-status-monitor:local
+    container_name: dr-status-monitor
+    ports:
+      - "8080:8080"
+    environment:
+      APP_REGION:   "local"
+      APP_ENV:      "development"
+      APP_VERSION:  "1.0.0"
+      DB_HOST:      postgres
+      DB_PORT:      "5432"
+      DB_NAME:      drplatform
+      DB_USER:      dbadmin
+      DB_PASSWORD:  localpassword
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - dr-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: dr-postgres
+    environment:
+      POSTGRES_DB:       drplatform
+      POSTGRES_USER:     dbadmin
+      POSTGRES_PASSWORD: localpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbadmin -d drplatform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dr-network
+
+  # Prometheus — same config as Kubernetes (for local testing)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: dr-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - dr-network
+
+volumes:
+  postgres_data:
+
+networks:
+  dr-network:
+    driver: bridge

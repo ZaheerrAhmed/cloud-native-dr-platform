@@ -1,0 +1,43 @@
+---
+# Hourly backup of the dr-app namespace (achieves RPO < 1 hour)
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: dr-app-hourly
+  namespace: velero
+spec:
+  schedule: "0 * * * *"    # every hour
+  template:
+    ttl: 168h               # keep for 7 days
+    includedNamespaces:
+      - dr-app
+    storageLocation: default
+    volumeSnapshotLocations:
+      - default
+    snapshotVolumes: true
+    metadata:
+      labels:
+        backup-type: scheduled
+        environment: primary
+---
+# Daily full-cluster backup (for compliance / ISO 22301)
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: full-cluster-daily
+  namespace: velero
+spec:
+  schedule: "0 2 * * *"    # 2 AM daily
+  template:
+    ttl: 720h               # keep for 30 days
+    excludedNamespaces:
+      - kube-system
+      - kube-public
+    storageLocation: default
+    volumeSnapshotLocations:
+      - default
+    snapshotVolumes: true
+    metadata:
+      labels:
+        backup-type: full
+        compliance: iso-22301

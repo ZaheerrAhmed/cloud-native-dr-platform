@@ -1,0 +1,18 @@
+# ============================================================
+# terraform.tfvars.example — DR region
+# Copy to terraform.tfvars and fill in after primary is deployed.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+# ============================================================
+
+# Your 12-digit AWS account number
+aws_account_id = "123456789012"
+
+# RDS ARN from primary deployment
+# Get it: cd terraform/primary && terraform output rds_primary_arn
+primary_db_arn = "arn:aws:rds:us-east-1:123456789012:db:dr-platform-primary-postgres"
+
+# S3 ARN from primary deployment
+# Get it: cd terraform/primary && terraform output velero_bucket
+# Then: arn:aws:s3:::BUCKET_NAME
+primary_velero_bucket_arn = "arn:aws:s3:::dr-platform-primary-velero-primary"

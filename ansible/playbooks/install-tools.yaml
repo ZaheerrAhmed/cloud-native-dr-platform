@@ -1,0 +1,135 @@
+---
+# ============================================================
+# install-tools.yaml — Install all tools on Jenkins / bastion
+# Run: ansible-playbook -i inventory/hosts.yaml playbooks/install-tools.yaml
+# ============================================================
+- name: Install DR Platform tools
+  hosts: jenkins
+  become: true
+  vars:
+    kubectl_version: "1.30.0"
+    helm_version: "3.15.0"
+    terraform_version: "1.9.0"
+    velero_version: "1.14.0"
+    argocd_version: "2.11.0"
+
+  tasks:
+
+    - name: Install system dependencies
+      package:
+        name:
+          - curl
+          - unzip
+          - git
+          - jq
+          - python3
+          - python3-pip
+          - docker
+        state: present
+
+    - name: Start and enable Docker
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add user to docker group
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: true
+
+    # ── AWS CLI ─────────────────────────────────────────────
+    - name: Install AWS CLI v2
+      shell: |
+        curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+        unzip -q /tmp/awscliv2.zip -d /tmp/
+        /tmp/aws/install --update
+        rm -rf /tmp/aws /tmp/awscliv2.zip
+      args:
+        creates: /usr/local/bin/aws
+
+    # ── kubectl ─────────────────────────────────────────────
+    - name: Install kubectl
+      get_url:
+        url: "https://dl.k8s.io/release/v{{ kubectl_version }}/bin/linux/amd64/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: "0755"
+
+    # ── Helm ────────────────────────────────────────────────
+    - name: Install Helm
+      shell: |
+        curl -fsSL https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz | tar -xz -C /tmp/
+        mv /tmp/linux-amd64/helm /usr/local/bin/helm
+        chmod +x /usr/local/bin/helm
+      args:
+        creates: /usr/local/bin/helm
+
+    # ── Terraform ───────────────────────────────────────────
+    - name: Install Terraform
+      unarchive:
+        src: "https://releases.hashicorp.com/terraform/{{ terraform_version }}/terraform_{{ terraform_version }}_linux_amd64.zip"
+        dest: /usr/local/bin/
+        remote_src: true
+        mode: "0755"
+
+    # ── Velero CLI ──────────────────────────────────────────
+    - name: Install Velero CLI
+      shell: |
+        curl -fsSL https://github.com/vmware-tanzu/velero/releases/download/v{{ velero_version }}/velero-v{{ velero_version }}-linux-amd64.tar.gz \
+          | tar -xz -C /tmp/
+        mv /tmp/velero-v{{ velero_version }}-linux-amd64/velero /usr/local/bin/velero
+        chmod +x /usr/local/bin/velero
+      args:
+        creates: /usr/local/bin/velero
+
+    # ── ArgoCD CLI ──────────────────────────────────────────
+    - name: Install ArgoCD CLI
+      get_url:
+        url: "https://github.com/argoproj/argo-cd/releases/download/v{{ argocd_version }}/argocd-linux-amd64"
+        dest: /usr/local/bin/argocd
+        mode: "0755"
+
+    # ── driftctl ────────────────────────────────────────────
+    - name: Install driftctl (infrastructure drift detection)
+      shell: |
+        curl -fsSL https://github.com/snyk/driftctl/releases/latest/download/driftctl_linux_amd64 \
+          -o /usr/local/bin/driftctl
+        chmod +x /usr/local/bin/driftctl
+      args:
+        creates: /usr/local/bin/driftctl
+
+    # ── Helm repos ──────────────────────────────────────────
+    - name: Add Helm repositories
+      command: helm repo add {{ item.name }} {{ item.url }}
+      loop:
+        - { name: prometheus-community, url: "https://prometheus-community.github.io/helm-charts" }
+        - { name: grafana,              url: "https://grafana.github.io/helm-charts" }
+        - { name: vmware-tanzu,         url: "https://vmware-tanzu.github.io/helm-charts" }
+        - { name: opensearch,           url: "https://opensearch-project.github.io/helm-charts" }
+        - { name: fluent,               url: "https://fluent.github.io/helm-charts" }
+        - { name: argo,                 url: "https://argoproj.github.io/argo-helm" }
+        - { name: opa,                  url: "https://open-policy-agent.github.io/gatekeeper/charts" }
+        - { name: aws,                  url: "https://aws.github.io/eks-charts" }
+      become_user: "{{ ansible_user }}"
+
+    - name: Update Helm repos
+      command: helm repo update
+      become_user: "{{ ansible_user }}"
+
+    - name: Verify all tools installed
+      shell: |
+        echo "=== Tool Versions ===" && \
+        aws --version && \
+        kubectl version --client && \
+        helm version --short && \
+        terraform version && \
+        velero version --client-only && \
+        argocd version --client && \
+        driftctl version
+      register: versions
+      changed_when: false
+
+    - name: Show installed versions
+      debug:
+        msg: "{{ versions.stdout_lines }}"

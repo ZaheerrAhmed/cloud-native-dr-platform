@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dr-app
+  labels:
+    app.kubernetes.io/managed-by: argocd
+    environment: primary
+---
+# ConfigMap injected per-region by Ansible (--set region/environment)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dr-app-config
+  namespace: dr-app
+data:
+  region: "us-east-1"       # overridden to us-west-2 in DR cluster
+  environment: "primary"    # overridden to "dr" in DR cluster

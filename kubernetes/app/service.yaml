@@ -1,0 +1,38 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dr-status-monitor-svc
+  namespace: dr-app
+  labels:
+    app: dr-status-monitor
+spec:
+  type: LoadBalancer
+  selector:
+    app: dr-status-monitor
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+---
+# HorizontalPodAutoscaler — scale up under load
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: dr-status-monitor-hpa
+  namespace: dr-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: dr-status-monitor
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

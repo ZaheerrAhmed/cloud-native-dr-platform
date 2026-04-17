@@ -1,0 +1,218 @@
+// ============================================================
+// CI/CD Pipeline — DR Status Monitor
+// Stages: Checkout → Build & Test → SonarQube → Docker Build
+//         → Push to ECR → Deploy to EKS (primary) → Smoke Test
+// ============================================================
+
+pipeline {
+    agent { label 'docker' }
+
+    environment {
+        AWS_REGION          = 'us-east-1'
+        AWS_ACCOUNT_ID      = credentials('aws-account-id')
+        ECR_REPO            = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/dr-platform/dr-status-monitor"
+        EKS_CLUSTER_PRIMARY = 'dr-platform-primary-eks'
+        EKS_CLUSTER_DR      = 'dr-platform-dr-eks'
+        SONAR_PROJECT_KEY   = 'dr-status-monitor'
+        IMAGE_TAG           = "${BUILD_NUMBER}-${GIT_COMMIT[0..7]}"
+        NAMESPACE           = 'dr-app'
+        // GitHub personal access token stored in Jenkins credentials
+        // Create: Jenkins → Credentials → Secret text → ID: github-pat
+        GITHUB_TOKEN        = credentials('github-pat')
+        // ArgoCD server address (LoadBalancer DNS from: kubectl get svc argocd-server -n argocd)
+        ARGOCD_SERVER       = credentials('argocd-server-address')
+        ARGOCD_AUTH_TOKEN   = credentials('argocd-auth-token')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.IMAGE_TAG = "${BUILD_NUMBER}-${GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                dir('docker/app') {
+                    sh '''
+                        python3 -m venv venv
+                        . venv/bin/activate
+                        pip install -r requirements.txt pytest pytest-cov
+                        pytest tests/ --cov=app --cov-report=xml --cov-report=term || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    publishCoverage adapters: [coberturaAdapter('docker/app/coverage.xml')]
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh """
+                        sonar-scanner \
+                          -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                          -Dsonar.sources=docker/app \
+                          -Dsonar.python.coverage.reportPaths=docker/app/coverage.xml \
+                          -Dsonar.projectVersion=${IMAGE_TAG}
+                    """
+                }
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                dir('docker/app') {
+                    sh """
+                        docker build \
+                          --build-arg APP_VERSION=${IMAGE_TAG} \
+                          --tag ${ECR_REPO}:${IMAGE_TAG} \
+                          --tag ${ECR_REPO}:latest \
+                          --file Dockerfile .
+                    """
+                }
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                withAWS(region: AWS_REGION, credentials: 'aws-jenkins-credentials') {
+                    sh """
+                        aws ecr get-login-password --region ${AWS_REGION} \
+                          | docker login --username AWS --password-stdin \
+                              ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                        docker push ${ECR_REPO}:${IMAGE_TAG}
+                        docker push ${ECR_REPO}:latest
+                    """
+                }
+            }
+        }
+
+        stage('Terraform Plan (IaC validation)') {
+            when { branch 'main' }
+            steps {
+                withAWS(region: AWS_REGION, credentials: 'aws-jenkins-credentials') {
+                    dir('terraform/primary') {
+                        sh '''
+                            terraform init -input=false
+                            terraform validate
+                            terraform plan -input=false -out=tfplan
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Primary EKS') {
+            when { branch 'main' }
+            steps {
+                withAWS(region: AWS_REGION, credentials: 'aws-jenkins-credentials') {
+                    sh """
+                        aws eks update-kubeconfig \
+                          --region ${AWS_REGION} \
+                          --name ${EKS_CLUSTER_PRIMARY}
+
+                        # Update image in Git so ArgoCD picks it up (selfHeal-safe)
+                        sed -i "s|REPLACE_WITH_ECR_URL/dr-platform/dr-status-monitor:.*|${ECR_REPO}:${IMAGE_TAG}|g" \
+                          kubernetes/app/deployment.yaml
+                        git config user.email "jenkins@dr-platform.local"
+                        git config user.name "Jenkins CI"
+                        git add kubernetes/app/deployment.yaml
+                        git diff --cached --quiet || git commit -m "ci: deploy image ${IMAGE_TAG} [skip ci]"
+                        # Push using GitHub PAT embedded in remote URL (no SSH key needed)
+                        git push https://ZaheerrAhmed:${GITHUB_TOKEN}@github.com/ZaheerrAhmed/Business-continuity-project.git HEAD:main || true
+
+                        # Log into ArgoCD before syncing (required — argocd CLI is stateless)
+                        argocd login ${ARGOCD_SERVER} \
+                          --auth-token ${ARGOCD_AUTH_TOKEN} \
+                          --grpc-web --insecure || true
+
+                        # Trigger ArgoCD sync
+                        argocd app sync dr-status-monitor --grpc-web || true
+
+                        # Wait for rollout
+                        kubectl rollout status deployment/dr-status-monitor \
+                          -n ${NAMESPACE} --timeout=180s
+                    """
+                }
+            }
+        }
+
+        stage('Smoke Test') {
+            when { branch 'main' }
+            steps {
+                sh '''
+                    sleep 15
+                    APP_URL=$(kubectl get svc dr-status-monitor-svc -n dr-app \
+                                -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://${APP_URL}/health)
+                    if [ "$STATUS" != "200" ]; then
+                        echo "Smoke test FAILED — /health returned HTTP ${STATUS}"
+                        exit 1
+                    fi
+                    echo "Smoke test PASSED — /health returned HTTP 200"
+                '''
+            }
+        }
+
+        stage('Sync DR Region (ArgoCD)') {
+            when { branch 'main' }
+            steps {
+                withAWS(region: 'us-west-2', credentials: 'aws-jenkins-credentials') {
+                    sh """
+                        aws eks update-kubeconfig \
+                          --region us-west-2 \
+                          --name ${EKS_CLUSTER_DR}
+
+                        # Log into ArgoCD on DR cluster before syncing
+                        argocd login ${ARGOCD_SERVER} \
+                          --auth-token ${ARGOCD_AUTH_TOKEN} \
+                          --grpc-web --insecure || true
+
+                        # ArgoCD syncs DR cluster from same Git repo
+                        argocd app sync dr-status-monitor --grpc-web || true
+                        echo "DR cluster image updated to ${IMAGE_TAG}"
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend(
+                channel: '#deployments',
+                color: 'good',
+                message: "✅ *DR Platform* build #${BUILD_NUMBER} deployed successfully\nImage: `${ECR_REPO}:${IMAGE_TAG}`\nBranch: `${GIT_BRANCH}`"
+            )
+        }
+        failure {
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "❌ *DR Platform* build #${BUILD_NUMBER} FAILED\nBranch: `${GIT_BRANCH}`\nCheck: ${BUILD_URL}"
+            )
+        }
+        always {
+            sh 'docker rmi ${ECR_REPO}:${IMAGE_TAG} || true'
+            cleanWs()
+        }
+    }
+}

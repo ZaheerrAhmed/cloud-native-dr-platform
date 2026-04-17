@@ -1,0 +1,21 @@
+# Velero is installed via CLI (see ansible/playbooks/deploy-k8s-tools.yaml)
+# This file documents the configuration used
+configuration:
+  provider: aws
+  backupStorageLocation:
+    name: default
+    provider: aws
+    bucket: dr-platform-primary-velero-primary
+    config:
+      region: us-east-1
+  volumeSnapshotLocation:
+    name: default
+    provider: aws
+    config:
+      region: us-east-1
+credentials:
+  useSecret: false   # IRSA used — no secret needed
+serviceAccount:
+  server:
+    annotations:
+      eks.amazonaws.com/role-arn: "REPLACE_WITH_VELERO_ROLE_ARN"

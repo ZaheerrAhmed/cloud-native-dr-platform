@@ -1,489 +1,283 @@
- 🚀 Azure Infrastructure as Code with Terraform
+<div align="center">
 
-Complete Infrastructure as Code solution for deploying production-ready Azure Kubernetes Service (AKS) with PostgreSQL databases, storage accounts, and disaster recovery capabilities.
+# Phoenix DR Platform
 
+### *A Cloud-Native Disaster Recovery System That Heals Itself*
 
- 📋 Table of Contents
+[![AWS](https://img.shields.io/badge/AWS-Multi--Region-FF9900?style=flat&logo=amazonaws)](https://aws.amazon.com)
+[![Terraform](https://img.shields.io/badge/Terraform-1.9-7B42BC?style=flat&logo=terraform)](https://terraform.io)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-1.30-326CE5?style=flat&logo=kubernetes)](https://kubernetes.io)
+[![ArgoCD](https://img.shields.io/badge/ArgoCD-GitOps-EF7B4D?style=flat&logo=argo)](https://argoproj.github.io)
+[![License](https://img.shields.io/badge/Standard-ISO%2022301-blue)](https://www.iso.org/standard/75106.html)
 
- [Overview]
- [Features]
- [Prerequisites]
- [Quick Start]
- [Infrastructure Components]
- [Configuration]
- [Usage]
- [Outputs]
- [Disaster Recovery]
- [Troubleshooting]
- [Author]
+**RTO < 5 minutes &nbsp;|&nbsp; RPO < 1 minute &nbsp;|&nbsp; Zero human intervention required**
 
-
-
-🎯 Overview
-
-This project automates Azure infrastructure deployment using Terraform. What previously took 8+ hours of manual work now deploys in 15 minutes with a single command.
-
-The Problem
-
-Manual infrastructure provisioning is:
-- Time-consuming (8+ hours)
-- Error-prone (human mistakes)
-- Hard to replicate exactly
-- Difficult to collaborate on
-- Not version controlled
-
-The Solution
-
-Infrastructure as Code provides:
-- Fast deployment (15 minutes)
-- Zero errors (tested code)
-- Perfect replication every time
-- Easy team collaboration
-- Full version control
+</div>
 
 ---
 
-## ✨ Features
+## The Problem This Solves
 
-- **One-Click Deployment** - Deploy entire infrastructure with `./deploy.sh primary`
-- **One-Click Cleanup** - Remove all resources with `./destroy.sh primary`
-- **Secure Secrets** - Passwords stored in Azure Key Vault
-- **Remote State** - Terraform state stored in Azure Storage
-- **Reproducible** - Destroy and recreate identical infrastructure
-- **Multi-Environment** - Deploy dev, staging, production from same code
-- **Version Controlled** - Track all infrastructure changes
+Most disaster recovery plans are PDF documents that live in a SharePoint folder nobody opens.
 
----
+When a region goes down at 2 AM, those documents require an engineer to wake up, read the runbook, SSH into servers, run commands in the right order, update DNS, restart services, and pray nothing was missed. That process takes hours. In 2025, the AWS us-east-1 outage cost businesses an estimated **$581 million** — not because the problem was hard to fix, but because humans are slow.
 
-## 📦 Prerequisites
+This platform replaces the runbook with code. When the primary region fails:
 
-### Required Tools
+1. Route 53 detects it in **30 seconds**
+2. EventBridge routes the event to a Lambda function
+3. Lambda promotes the RDS read replica to a standalone primary in us-west-2
+4. Lambda scales the standby EKS cluster from 1 node to 3
+5. Route 53 DNS flips automatically — no human clicks DNS, it's health-check-based
+6. ArgoCD ensures the DR cluster is already running the latest code, always
 
-- **Azure CLI** (v2.50+) - [Installation Guide](https://aka.ms/InstallAzureCLI)
-- **Terraform** (v1.6+) - [Installation Guide](https://www.terraform.io/downloads)
-- **kubectl** (Latest) - [Installation Guide](https://kubernetes.io/docs/tasks/tools/)
-- **Git** (Latest)
-
-### Azure Requirements
-
-- Active Azure subscription
-- Contributor role on subscription
-
-### Verify Installation
-```bash
-az --version      # Azure CLI
-terraform version # Terraform
-kubectl version   # Kubernetes CLI
-git --version     # Git
-```
+Total elapsed time from failure to traffic-on-DR: **under 5 minutes**. Total engineer intervention required: **zero**.
 
 ---
 
-## 🚀 Quick Start
+## Architecture
 
-### 1. Clone Repository
-```bash
-git clone https://github.com/YOUR_USERNAME/azure-infrastructure-terraform.git
-cd azure-infrastructure-terraform
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            DEVELOPER WORKFLOW                               │
+│  git push → Jenkins CI → Docker build → ECR push → Git commit (image tag)  │
+│                                              ↓                              │
+│                                   ArgoCD syncs both clusters                │
+└────────────────────────────────────────────────┬────────────────────────────┘
+                                                 │
+              ┌──────────────────────────────────┼──────────────────────────┐
+              │                                  │                          │
+              ▼                                  ▼                          │
+┌─────────────────────────────┐    ┌─────────────────────────────────────┐  │
+│  us-east-1  —  PRIMARY      │    │        us-west-2  —  DR STANDBY     │  │
+│                             │    │                                     │  │
+│  EKS 1.30  (2–4 nodes)      │    │  EKS 1.30  (1 node → 3 on failover)│  │
+│  ┌─────────────────────┐    │    │  ┌──────────────────────────────┐  │  │
+│  │  dr-status-monitor  │    │    │  │  dr-status-monitor (ArgoCD)  │  │  │
+│  │  Prometheus+Grafana │    │    │  │  Prometheus + Grafana        │  │  │
+│  │  OpenSearch+FluentBit    │    │  │  OpenSearch + Fluent Bit     │  │  │
+│  │  Velero  (hourly)   │    │    │  │  Velero  (receives replica)  │  │  │
+│  │  ArgoCD             │    │    │  └──────────────────────────────┘  │  │
+│  │  OPA Gatekeeper     │    │    │                                     │  │
+│  │  Drift Detection    │    │    │  RDS PostgreSQL 16                  │  │
+│  └─────────────────────┘    │    │  Read Replica  ──► Promoted         │  │
+│                             │    │  on failover   (WAL lag < 1s)       │  │
+│  RDS PostgreSQL 16          │WAL │                                     │  │
+│  Multi-AZ primary       ────┼───►│  S3 Velero Bucket                   │  │
+│                             │CRR │  (receives cross-region replicas)   │  │
+│  S3 Velero Bucket       ────┼───►└─────────────────────────────────────┘  │
+│                             │                        ▲                     │
+│  Lambda Failover Handler    │               ArgoCD sync (same Git repo)    │
+│  EventBridge Rule           │                                              │
+│  Route 53 Health Check ─────┼──── /health HTTP check every 10s ───────────┘
+│  AWS Config + CloudWatch    │     3 failures = ALARM → Lambda fires
+└─────────────────────────────┘
 ```
 
-### 2. Login to Azure
-```bash
-az login
-az account set --subscription "YOUR_SUBSCRIPTION_ID"
+**Automated failover chain:**
 ```
-
-### 3. Deploy Infrastructure
-```bash
-chmod +x deploy.sh destroy.sh
-./deploy.sh primary
-```
-
-**That's it!** Infrastructure deploys in approximately 15 minutes.
-
-### 4. Verify Deployment
-```bash
-terraform output
-kubectl get nodes
+Route53 health check fails (30s)
+  → CloudWatch alarm (ALARM state)
+    → EventBridge pattern match
+      → Lambda: rds.promote_read_replica()
+      → Lambda: eks.update_nodegroup_config(desiredSize=3)
+      → Lambda: sns.publish()  ← email alert to operator
+        → Route53 DNS flips to DR ALB  ← automatic, health-check-based
+          → Traffic served from us-west-2
 ```
 
 ---
 
-## 🏗️ Infrastructure Components
+## Technology Stack
 
-This Terraform configuration creates the following Azure resources:
-
-### Compute & Container
-- **AKS Cluster** - Kubernetes cluster with autoscaling (1-3 nodes)
-  - VM Size: Standard_DC2ads_v5
-  - Kubernetes Version: 1.33.5
-  - Network: Azure CNI with Overlay mode
-
-### Database
-- **PostgreSQL Primary** - Main database server
-  - SKU: GP_Standard_D2s_v3
-  - Storage: 32GB
-  - Version: 16
-  
-- **PostgreSQL DR Replica** - Disaster recovery database
-  - Same configuration as primary
-  - Located in different region
-
-### Storage
-- **Primary Storage Account** - Cloud Shell storage
-  - Replication: RAGRS
-  - Tier: Hot
-  
-- **Velero Storage Account** - Kubernetes backup storage
-  - Replication: RAGRS
-  - Tier: Hot
-
-### Network
-- **Virtual Network** - Network infrastructure
-  - Address Space: 10.0.0.0/16
-
-### Management
-- **Azure Key Vault** - Secure password storage
-- **Storage Account** - Terraform state storage
+| Layer | Technology | Why This Choice |
+|-------|-----------|----------------|
+| Infrastructure | **Terraform 1.9** (modular) | Reproducible, reviewable, versioned infrastructure |
+| Container Platform | **AWS EKS 1.30** | Managed K8s — no control plane to babysit; IRSA for pod-level IAM |
+| Database | **RDS PostgreSQL 16** | Multi-AZ + cross-region replica; managed backups; WAL replication lag < 1s |
+| Backup | **Velero 1.14** + S3 CRR | K8s-native backup; CRR ensures DR region has copies before disaster |
+| GitOps | **ArgoCD 2.11** | Both clusters always in sync; selfHeal reverts manual drift; full audit trail |
+| CI/CD | **Jenkins** (Groovy pipeline) | Build → test → ECR → Git commit → ArgoCD sync; ArgoCD-safe (no `kubectl set image`) |
+| Monitoring | **Prometheus + Grafana** | kube-prometheus-stack; /metrics auto-scraped from app; AlertManager ready |
+| Logging / SIEM | **OpenSearch + Fluent Bit** | Centralized logs across both clusters; EKS control plane logs included |
+| Policy | **OPA Gatekeeper** | Admission control: resource limits + liveness probes enforced at API server |
+| Drift Detection | **driftctl + Groq AI** | Every 6h: scan IaC drift → Groq llama3-70b analyses risk → Slack + SNS alert |
+| Secrets | **AWS Secrets Manager** | DB password auto-generated by Terraform; never in Git, logs, or env files |
+| Image Registry | **AWS ECR** | Lifecycle policies; vulnerability scan on push; ECR replication to DR region |
+| Failover Orchestrator | **AWS Lambda** (Python 3.12) | Event-driven; sub-30s execution; no servers to maintain |
+| DNS Failover | **Route 53** health checks | Health-check-based automatic DNS flip; no API call needed to switch traffic |
+| Automation | **Ansible** | Idempotent tool install + K8s secrets injection |
 
 ---
 
-## ⚙️ Configuration
+## Key Design Decisions
 
-### Basic Configuration
+**Why not just use RDS Multi-AZ for DR?**
+Multi-AZ protects against AZ failure within a region. A full regional outage (like us-east-1 going dark) takes everything down. You need a separate region with an independent RDS instance. Multi-AZ is the primary's resilience within us-east-1; the read replica in us-west-2 is the cross-region DR.
 
-Edit `variables.tf` to customize your deployment:
-```hcl
-# Azure Subscription
-variable "subscription_id" {
-  default = "YOUR_SUBSCRIPTION_ID"
-}
+**Why does the DR EKS cluster run 1 node at standby?**
+Running 3 nodes × 24/7 in both regions doubles the compute cost for zero benefit during normal operation. The Lambda failover handler scales from 1 → 3 in ~3 minutes. That's an acceptable trade-off: save ~60% on standby costs, accept 3 extra minutes of EKS capacity ramp-up during failover.
 
-# Environment Name
-variable "environment" {
-  default = "primary"
-}
+**Why commit image tags to Git instead of `kubectl set image`?**
+ArgoCD has `selfHeal: true` — it continuously reconciles cluster state to match Git. If Jenkins uses `kubectl set image`, ArgoCD immediately reverts it (Git still has `REPLACE_WITH_ECR_URL`). The only correct way to update a workload under ArgoCD is to update Git. Jenkins commits the new image tag; ArgoCD detects the commit and deploys it. Full audit trail, no drift.
 
-# AKS Settings
-variable "aks_node_count" {
-  default = 1
-}
+**Why Groq API instead of self-hosted Ollama?**
+Ollama requires 3–4 GB of additional RAM per node to run llama3.2 locally. At `t3.large` node size, this would exhaust memory and cause OOM kills of other workloads. Groq's free tier (14,400 requests/day on llama3-70b-8192) is more capable and costs nothing. Ollama remains as a fallback if the Groq key is not set.
 
-variable "aks_vm_size" {
-  default = "Standard_DC2ads_v5"
-}
+**Why OPA Gatekeeper in `warn` mode?**
+In a new cluster, switching directly to `deny` mode would block any deployment that doesn't meet the policy — including Helm charts from third parties. Starting in `warn` mode lets operators see violations without breakage, then graduate to `deny` once all charts are compliant. This is production practice, not a shortcut.
 
-# PostgreSQL Settings
-variable "postgres_sku_name" {
-  default = "GP_Standard_D2s_v3"
-}
+---
 
-variable "postgres_storage_mb" {
-  default = 32768
-}
+## Repository Structure
 
-# Regions
-variable "primary_location" {
-  default = "eastus"
-}
-
-variable "postgres_location" {
-  default = "westus"
-}
 ```
-
-### Using Environment Variables
-```bash
-export TF_VAR_subscription_id="YOUR_SUBSCRIPTION_ID"
-export TF_VAR_environment="production"
-export TF_VAR_aks_node_count=3
+phoenix-dr-platform/
+├── terraform/
+│   ├── primary/               # us-east-1 — VPC, EKS, RDS, S3, Lambda, Route53, ECR, Config
+│   │   ├── main.tf
+│   │   ├── outputs.tf
+│   │   ├── variables.tf
+│   │   ├── backend.tf         # S3 remote state
+│   │   ├── provider.tf        # aws + aws.dr alias
+│   │   └── terraform.tfvars.example
+│   ├── dr/                    # us-west-2 — VPC, EKS (standby), RDS replica, S3
+│   └── modules/               # vpc · eks · rds · s3 · route53
+├── kubernetes/
+│   ├── app/                   # Deployment, Service, HPA, ServiceAccount
+│   ├── argocd/                # App-of-Apps (watches this directory only)
+│   ├── monitoring/            # kube-prometheus-stack Helm values
+│   ├── logging/               # OpenSearch + Fluent Bit Helm values
+│   ├── velero/                # Backup schedules (hourly + daily)
+│   ├── opa-gatekeeper/        # ISO 22301 admission constraints (ConstraintTemplate + Constraint)
+│   └── drift-detection/       # driftctl CronJob + AI Analyzer Deployment + shared PVC
+├── lambda/
+│   └── failover_handler.py    # RDS promote + EKS scale-up + SNS alert
+├── docker/
+│   └── app/                   # Flask app, Dockerfile (multi-stage), requirements.txt
+├── jenkins/
+│   └── Jenkinsfile            # 7-stage pipeline: test → SonarQube → build → ECR → GitOps deploy
+├── ansible/
+│   ├── inventory/hosts.yaml   # local connection (runs on Ubuntu VM)
+│   └── playbooks/
+│       ├── install-tools.yaml       # kubectl, Helm, Terraform, Velero, ArgoCD, driftctl
+│       ├── deploy-k8s-tools.yaml    # Helm charts + K8s secrets injection
+│       └── drift-remediation.yaml   # Groq AI drift analysis via Ansible
+└── scripts/
+    ├── deploy-primary.sh      # End-to-end primary region deployment
+    └── deploy-dr.sh           # End-to-end DR region deployment
 ```
 
 ---
 
-## 💻 Usage
+## Deploy
 
-### Common Commands
 ```bash
-# Deploy infrastructure
-./deploy.sh primary
+# Prerequisites (install once — handled by ansible/playbooks/install-tools.yaml)
+# AWS CLI, Terraform >= 1.6, kubectl, Helm, Ansible, Velero CLI, ArgoCD CLI, driftctl
+# See: ansible/playbooks/install-tools.yaml
 
-# View all outputs
-terraform output
+# Store secrets in AWS Secrets Manager (one-time)
+aws secretsmanager create-secret --region us-east-1 \
+  --name "dr-platform/groq-api-key" \
+  --secret-string "gsk_YOUR_KEY"    # free key: https://console.groq.com
 
-# View specific output
-terraform output aks_cluster_name
+# Export required variables
+export ALERT_EMAIL="your@email.com"
+export GROQ_API_KEY=$(aws secretsmanager get-secret-value \
+  --region us-east-1 --secret-id "dr-platform/groq-api-key" \
+  --query SecretString --output text)
 
-# Get Kubernetes credentials
-az aks get-credentials \
-  --resource-group aks-primary_group \
-  --name aks-primary
+# Deploy primary region (us-east-1) — ~20 minutes
+./scripts/deploy-primary.sh
 
-# Check cluster status
-kubectl get nodes
-kubectl get pods --all-namespaces
-
-# Update infrastructure
-terraform plan
-terraform apply
-
-# Destroy infrastructure
-./destroy.sh primary
+# Deploy DR standby (us-west-2) — ~15 minutes (run after primary completes)
+./scripts/deploy-dr.sh
 ```
 
-### Advanced Commands
-```bash
-# Validate configuration
-terraform validate
-
-# Format Terraform files
-terraform fmt
-
-# Show current state
-terraform show
-
-# List all resources
-terraform state list
-
-# Refresh state from Azure
-terraform refresh
-
-# Plan with output file
-terraform plan -out=tfplan
-
-# Apply saved plan
-terraform apply tfplan
-```
+What these scripts do automatically:
+1. Bootstrap Terraform remote state (S3 + DynamoDB)
+2. `terraform apply` — VPC, EKS, RDS, S3, Lambda, Route53, ECR, IAM, AWS Config
+3. `aws eks update-kubeconfig` — configure kubectl
+4. `ansible-playbook deploy-k8s-tools.yaml` — install all Helm charts, inject K8s secrets
+5. Application deployed via ArgoCD from this Git repository
 
 ---
 
-## 📤 Outputs
+## How Secrets Flow (Zero Plaintext Anywhere)
 
-After successful deployment, the following information is available:
-```bash
-terraform output
+```
+Terraform random_password (24 chars)
+         │
+         ▼
+AWS Secrets Manager  ←─── never written to disk, never in Git
+         │
+         ▼ (at deploy time, Ansible fetches it)
+kubectl create secret generic db-credentials
+         │
+         ▼ (Kubernetes injects as env var)
+Pod: DB_PASSWORD=<value>   ←── no_log: true in Ansible, never in logs
 ```
 
-### Output Values
-
-- `resource_group_name` - Azure resource group name
-- `aks_cluster_name` - AKS cluster name
-- `aks_cluster_fqdn` - AKS cluster fully qualified domain name
-- `aks_node_resource_group` - AKS node resource group
-- `postgres_primary_fqdn` - PostgreSQL primary server address
-- `postgres_dr_fqdn` - PostgreSQL DR replica address
-- `postgres_connection_string` - Database connection string
-- `storage_account_velero_name` - Velero backup storage name
-- `vnet_name` - Virtual network name
-- `get_kubeconfig_command` - Command to configure kubectl
-
-### Using Outputs
-```bash
-# Get cluster name
-CLUSTER=$(terraform output -raw aks_cluster_name)
-
-# Get resource group
-RG=$(terraform output -raw resource_group_name)
-
-# Use in commands
-az aks show --name $CLUSTER --resource-group $RG
-```
+Every credential follows the same pattern. The only credential that touches the VM directly is the AWS CLI key, which lives in `~/.aws/credentials` and is never committed.
 
 ---
 
-## 🔄 Disaster Recovery
+## CI/CD Pipeline
 
-### Test DR Workflow
-
-This demonstrates the power of Infrastructure as Code:
-```bash
-# Step 1: View current infrastructure
-terraform output
-kubectl get nodes
-
-# Step 2: Destroy everything
-./destroy.sh primary
-# Confirm with 'yes' then 'destroy'
-
-# Step 3: Verify deletion
-az resource list --resource-group aks-primary_group
-
-# Step 4: Recreate infrastructure
-./deploy.sh primary
-# Press ENTER when prompted
-
-# Step 5: Verify recreation
-terraform output
-kubectl get nodes
+```
+git push origin main
+      │
+      ▼
+Jenkins (7 stages)
+  ├── Checkout
+  ├── Unit Tests          (pytest + coverage → Cobertura report)
+  ├── SonarQube Analysis  (code quality gate)
+  ├── Docker Build        (multi-stage, non-root user, port 8080)
+  ├── Push to ECR         (tagged + latest; vulnerability scan on push)
+  ├── Terraform Validate  (plan-only — IaC sanity check on main branch)
+  └── Deploy
+        ├── Update image tag in kubernetes/app/deployment.yaml
+        ├── git commit + push  (ArgoCD-safe — never kubectl set image)
+        ├── argocd app sync (primary)
+        └── argocd app sync (DR cluster)
 ```
 
-Infrastructure is recreated identically in approximately 15 minutes.
-
-### Deploy to Multiple Environments
-```bash
-# Deploy primary environment
-./deploy.sh primary
-
-# Deploy DR environment
-./deploy.sh dr
-
-# Deploy development environment
-./deploy.sh dev
-```
+ArgoCD's `selfHeal: true` means the cluster is always the authoritative reflection of Git. Any out-of-band change is automatically reverted. This makes every deployment auditable and every rollback a `git revert`.
 
 ---
 
-## 🐛 Troubleshooting
+## Observability
 
-### Authentication Issues
-```bash
-# Re-authenticate with Azure
-az login
-az account set --subscription "YOUR_SUBSCRIPTION_ID"
-az account show
-```
-
-### State Lock Issues
-```bash
-# Check lock status
-terraform force-unlock -help
-
-# Unlock if necessary (use with caution)
-terraform force-unlock LOCK_ID
-```
-
-### Key Vault Access Issues
-```bash
-# List Key Vaults
-az keyvault list --query "[].name"
-
-# Check permissions
-az keyvault show --name YOUR_KEY_VAULT_NAME
-```
-
-### Resource Already Exists
-```bash
-# Import existing resource
-terraform import azurerm_resource_group.aks_primary \
-  /subscriptions/SUBSCRIPTION_ID/resourceGroups/RESOURCE_GROUP_NAME
-```
-
-### Permission Denied
-```bash
-# Check your role assignments
-az role assignment list --assignee YOUR_EMAIL
-
-# You need "Contributor" role on the subscription
-```
-
-### Debug Mode
-```bash
-# Enable detailed logging
-export TF_LOG=DEBUG
-terraform plan
-
-# Disable logging
-unset TF_LOG
-```
+| Signal | Tool | What It Covers |
+|--------|------|---------------|
+| Metrics | Prometheus + Grafana | CPU, memory, request rate, error rate, DB connection pool |
+| Logs | Fluent Bit → OpenSearch | Application logs, EKS control-plane logs, Lambda logs |
+| Traces | (future: OpenTelemetry) | — |
+| Alerts | AlertManager + SNS + Slack | Failover events, HIGH/CRITICAL drift, health check failures |
+| Drift | driftctl + Groq AI | IaC vs live-state gap detection every 6 hours |
+| Compliance | AWS Config | Continuous resource configuration recording |
+| Audit | CloudWatch + OpenSearch | All API calls, pod lifecycle, failover events |
 
 ---
 
-## 📁 Project Structure
-```
-.
-├── README.md                 # Documentation
-├── .gitignore               # Files to ignore in Git
-│
-├── main.tf                  # Infrastructure resources
-├── variables.tf             # Variable definitions
-├── outputs.tf               # Output values
-├── provider.tf              # Azure provider configuration
-├── backend.tf               # Remote state configuration
-├── data.tf                  # Data sources
-│
-├── deploy.sh                # Deployment script
-└── destroy.sh               # Cleanup script
-```
+## Compliance Alignment
+
+| Control | Implementation |
+|---------|---------------|
+| ISO 22301 §8.4 — Business impact analysis | RTO/RPO targets defined and tested via health check automation |
+| ISO 22301 §8.5 — Business continuity strategy | Active-standby architecture with automated promotion |
+| NIST SP 800-34 §3.4 — Alternate site | us-west-2 DR region, independent VPC, independent RDS |
+| NIST SP 800-34 §3.5 — Data backup | Velero hourly backups + RDS automated 7-day backups + S3 CRR |
+| OPA Gatekeeper | All Deployments must have resource limits + liveness probes |
+| IMDSv2 required | SSRF protection on all EKS node launch templates |
+| Encryption at rest | EBS gp3 volumes encrypted; RDS storage encrypted; S3 SSE-AES256 |
+| Secrets management | AWS Secrets Manager; zero plaintext credentials in code or logs |
 
 ---
 
-## 📊 Results
-
-### Before Infrastructure as Code
-
-- Deployment Time: **8 hours**
-- Error Rate: **~15%** (human errors)
-- Reproducibility: **Low**
-- Team Collaboration: **Difficult**
-- Documentation: **Manual/Outdated**
-
-### After Infrastructure as Code
-
-- Deployment Time: **15 minutes**
-- Error Rate: **0%** (automated)
-- Reproducibility: **100%**
-- Team Collaboration: **Easy**
-- Documentation: **Self-documenting**
-
-### Key Improvements
-
-- ✅ 97% reduction in deployment time
-- ✅ 100% elimination of human errors
-- ✅ Perfect reproducibility
-- ✅ Easy team collaboration
-- ✅ Complete version control
-
----
-
-## 📚 Documentation
-
-### Official Resources
-
-- [Terraform Documentation](https://www.terraform.io/docs)
-- [Azure Terraform Provider](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs)
-- [Azure CLI Reference](https://docs.microsoft.com/en-us/cli/azure/)
-- [AKS Documentation](https://docs.microsoft.com/en-us/azure/aks/)
-
-### Learning Resources
-
-- [Terraform Tutorials](https://learn.hashicorp.com/terraform)
-- [Azure Architecture Center](https://docs.microsoft.com/en-us/azure/architecture/)
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
-
----
-
-## 👤 Author
+## Author
 
 **Zaheer Ahmed**
-
-Cloud Engineer | DevOps Enthusiast
-
-- LinkedIn: https://www.linkedin.com/in/zaheerr-ahmed
-
-
-## 🌟 Acknowledgments
-
-Special thanks to:
-- HashiCorp for Terraform
-- Microsoft Azure team
-- Open source community
-
----
-
-## ⭐ Support
-
-If you found this project helpful, please give it a star!
-
----
-
-**Made with ❤️ | Infrastructure as Code**
+Cloud & DevOps Engineer — EduQual Level 6
+Al-Nafi International College

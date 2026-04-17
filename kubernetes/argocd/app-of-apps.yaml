@@ -1,0 +1,48 @@
+---
+# ArgoCD App-of-Apps — manages all DR platform applications
+# Applied once; ArgoCD then continuously syncs all apps from Git
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: dr-platform-apps
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ZaheerrAhmed/Business-continuity-project
+    targetRevision: main
+    path: kubernetes/argocd   # only watch ArgoCD Application CRDs here
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true       # remove resources deleted from Git
+      selfHeal: true    # revert manual changes in cluster
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+# DR Status Monitor application
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: dr-status-monitor
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ZaheerrAhmed/Business-continuity-project
+    targetRevision: main
+    path: kubernetes/app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: dr-app
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

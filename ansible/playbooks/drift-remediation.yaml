@@ -1,0 +1,128 @@
+---
+# ============================================================
+# drift-remediation.yaml — Infrastructure Drift Detection & Auto-Fix
+# Runs driftctl scan, sends report to Groq API for AI analysis,
+# then auto-remediates detected drift using Terraform
+# Run: ansible-playbook -i inventory/hosts.yaml playbooks/drift-remediation.yaml
+#        -e "groq_api_key=$GROQ_API_KEY"
+# ============================================================
+- name: Detect and remediate infrastructure drift
+  hosts: jenkins
+  vars:
+    primary_region: "us-east-1"
+    terraform_dir: "{{ playbook_dir }}/../../terraform/primary"
+    drift_report_path: "/tmp/driftctl-report.json"
+    groq_api_url: "https://api.groq.com/openai/v1/chat/completions"
+    groq_model: "llama3-70b-8192"
+
+  tasks:
+
+    - name: Configure AWS credentials
+      shell: aws sts get-caller-identity
+      register: identity
+      changed_when: false
+
+    - name: Run driftctl scan — detect infrastructure drift
+      shell: |
+        export AWS_DEFAULT_REGION={{ primary_region }}
+        driftctl scan \
+          --output json://{{ drift_report_path }} \
+          --from tfstate+s3://dr-platform-tfstate-primary/primary/terraform.tfstate
+      register: drift_scan
+      ignore_errors: true   # driftctl exits 1 when drift found (not an error)
+
+    - name: Read drift report
+      slurp:
+        src: "{{ drift_report_path }}"
+      register: drift_report_raw
+
+    - name: Parse drift report
+      set_fact:
+        drift_report: "{{ drift_report_raw.content | b64decode | from_json }}"
+
+    - name: Show drift summary
+      debug:
+        msg:
+          - "Total resources tracked: {{ drift_report.summary.total_resources }}"
+          - "Resources in sync: {{ drift_report.summary.total_managed }}"
+          - "Drifted resources: {{ drift_report.differences | length }}"
+
+    - name: Send drift report to Groq AI for analysis
+      uri:
+        url: "{{ groq_api_url }}"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ groq_api_key }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          model: "{{ groq_model }}"
+          messages:
+            - role: "system"
+              content: >
+                You are a Cloud Infrastructure Security and Reliability expert
+                specialising in AWS, ISO 22301, and NIST SP 800-34.
+                Always respond with valid JSON only.
+            - role: "user"
+              content: |
+                Analyze this AWS infrastructure drift report and respond in JSON:
+                {"resources": [{"id": "...", "risk": "Critical|High|Medium|Low",
+                "action": "auto-fix|manual-review|ignore",
+                "impact": "...", "compliance_violation": true/false}], "summary": "..."}
+
+                Drift Report:
+                {{ drift_report | to_json | truncate(3000) }}
+          temperature: 0.2
+          max_tokens: 1024
+          response_format:
+            type: "json_object"
+        timeout: 30
+      register: ai_analysis
+      ignore_errors: true
+
+    - name: Show AI analysis
+      debug:
+        msg: "{{ ai_analysis.json.choices[0].message.content | default('AI analysis unavailable') }}"
+      when: ai_analysis is not failed
+
+    - name: Auto-remediate drift with Terraform (plan first)
+      block:
+        - name: Terraform init
+          shell: cd {{ terraform_dir }} && terraform init -input=false
+          changed_when: false
+
+        - name: Terraform plan (see what would be changed)
+          shell: cd {{ terraform_dir }} && terraform plan -input=false -out=/tmp/drift-fix.tfplan 2>&1
+          register: tf_plan
+
+        - name: Show Terraform plan
+          debug:
+            msg: "{{ tf_plan.stdout_lines }}"
+
+        - name: Apply Terraform to fix drift (only if no deletions planned)
+          shell: |
+            cd {{ terraform_dir }}
+            # Safety: only auto-apply if no resources will be destroyed
+            DESTROY_COUNT=$(terraform show -json /tmp/drift-fix.tfplan | \
+              jq '[.resource_changes[] | select(.change.actions[] | contains("delete"))] | length')
+            if [ "$DESTROY_COUNT" -gt "0" ]; then
+              echo "SKIP: Plan includes $DESTROY_COUNT resource destructions — requires manual approval"
+              exit 0
+            fi
+            terraform apply -input=false -auto-approve /tmp/drift-fix.tfplan
+          register: tf_apply
+
+        - name: Show remediation result
+          debug:
+            msg: "{{ tf_apply.stdout_lines }}"
+
+      when: drift_report.differences | length > 0
+
+    - name: Publish drift report to SNS
+      shell: |
+        aws sns publish \
+          --region {{ primary_region }} \
+          --topic-arn "{{ lookup('env', 'SNS_TOPIC_ARN') }}" \
+          --subject "[Drift Detection] {{ drift_report.differences | length }} drifted resources" \
+          --message "Infrastructure drift detected: {{ drift_report.differences | length }} resources. Auto-remediation applied where safe. Review CloudWatch for details."
+      when: drift_report.differences | length > 0

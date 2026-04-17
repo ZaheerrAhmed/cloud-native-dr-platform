@@ -1,0 +1,54 @@
+# ============================================================
+# OpenSearch Helm values — SIEM / centralized logging
+# Collects logs from: EKS pods, RDS (via CloudWatch), Lambda,
+#   VPC flow logs, Kubernetes audit logs
+# helm upgrade --install opensearch opensearch/opensearch -n logging -f this-file.yaml
+# ============================================================
+
+clusterName: dr-platform-siem
+nodeGroup: master
+
+masterService: opensearch-cluster-master
+
+replicas: 2   # 1 in DR (standby), 2 in primary
+
+# Storage
+persistence:
+  enabled: true
+  storageClass: gp2
+  accessModes: [ReadWriteOnce]
+  size: 30Gi
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 1000m
+    memory: 2Gi
+
+# OpenSearch config
+opensearchJavaOpts: "-Xmx1g -Xms1g"
+
+config:
+  opensearch.yml: |
+    cluster.name: dr-platform-siem
+    network.host: 0.0.0.0
+    plugins.security.disabled: false
+    plugins.security.ssl.http.enabled: false
+
+    # Index lifecycle for log retention
+    plugins.index_management.enabled: true
+
+extraEnvs:
+  - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: opensearch-credentials
+        key: password
+
+service:
+  type: ClusterIP
+  port: 9200
+
+# Index templates will be applied by Fluent Bit init job

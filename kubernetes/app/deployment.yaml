@@ -1,0 +1,104 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dr-status-monitor
+  namespace: dr-app
+  labels:
+    app: dr-status-monitor
+    version: "1.0.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dr-status-monitor
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: dr-status-monitor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: dr-app-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: dr-status-monitor
+          image: REPLACE_WITH_ECR_URL/dr-platform/dr-status-monitor:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: APP_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: dr-app-config
+                  key: region
+            - name: APP_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: dr-app-config
+                  key: environment
+            - name: APP_VERSION
+              value: "1.0.0"
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: host
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              value: "drplatform"
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway   # DR cluster has 1 node — DoNotSchedule blocks 2nd pod
+          labelSelector:
+            matchLabels:
+              app: dr-status-monitor
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dr-app-sa
+  namespace: dr-app

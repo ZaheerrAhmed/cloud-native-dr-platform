@@ -1,0 +1,316 @@
+---
+# AI Drift Analyzer — reads driftctl JSON report, calls Groq API (free LLM),
+# posts risk assessment + remediation to OpenSearch + SNS + Slack
+#
+# AI Backend (controlled by env var):
+#   GROQ_API_KEY set  → uses Groq API (llama3-70b, free, fast, recommended)
+#   GROQ_API_KEY not set → falls back to Ollama (self-hosted, needs RAM)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-drift-analyzer
+  namespace: drift-detection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-drift-analyzer
+  template:
+    metadata:
+      labels:
+        app: ai-drift-analyzer
+    spec:
+      serviceAccountName: drift-detection-sa
+      initContainers:
+        - name: install-deps
+          image: python:3.12-slim
+          command: ["pip", "install", "--quiet", "--target=/deps",
+                    "boto3==1.34.0", "requests==2.31.0"]
+          volumeMounts:
+            - name: deps
+              mountPath: /deps
+      containers:
+        - name: analyzer
+          image: python:3.12-slim
+          command: ["python", "/app/analyzer.py"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          env:
+            - name: PYTHONPATH
+              value: "/deps"
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dr-secrets
+                  key: groq_api_key
+                  optional: true          # if not set, falls back to Ollama
+            - name: OLLAMA_URL
+              value: "http://ollama-service:11434"
+            - name: OPENSEARCH_URL
+              value: "http://opensearch-cluster-master.logging.svc.cluster.local:9200"
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-1"
+            - name: SNS_TOPIC_ARN
+              valueFrom:
+                secretKeyRef:
+                  name: dr-secrets
+                  key: sns_topic_arn
+            - name: SLACK_WEBHOOK
+              valueFrom:
+                secretKeyRef:
+                  name: dr-secrets
+                  key: slack_webhook
+          volumeMounts:
+            - name: analyzer-script
+              mountPath: /app
+            - name: reports
+              mountPath: /reports
+            - name: deps
+              mountPath: /deps
+      volumes:
+        - name: analyzer-script
+          configMap:
+            name: ai-analyzer-script
+        - name: reports
+          persistentVolumeClaim:
+            claimName: drift-reports-pvc   # same PVC the CronJob writes to
+        - name: deps
+          emptyDir: {}                     # pip install target (init container → main container)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-analyzer-script
+  namespace: drift-detection
+data:
+  analyzer.py: |
+    """
+    AI Drift Analyzer
+    -----------------
+    Polls for driftctl JSON reports and analyses them using an LLM.
+
+    AI backend selection (automatic):
+      - If GROQ_API_KEY is set  → Groq API (llama3-70b-8192, free tier, fast)
+      - If GROQ_API_KEY not set → Ollama local (llama3.2, self-hosted)
+
+    Groq free tier: 14,400 requests/day — more than enough for 4 scans/day.
+    Get a free key at: https://console.groq.com
+    """
+    import os, json, time, boto3, requests, logging
+    from datetime import datetime, timezone
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger(__name__)
+
+    # ── Config ────────────────────────────────────────────────
+    GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+    GROQ_API_URL   = "https://api.groq.com/openai/v1/chat/completions"
+    GROQ_MODEL     = "llama3-70b-8192"          # free, fast, high quality
+
+    OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://ollama-service:11434")
+    OLLAMA_MODEL   = "llama3.2"                  # fallback if no Groq key
+
+    OPENSEARCH_URL = os.getenv("OPENSEARCH_URL")
+    SNS_TOPIC_ARN  = os.getenv("SNS_TOPIC_ARN")
+    SLACK_WEBHOOK  = os.getenv("SLACK_WEBHOOK")
+    AWS_REGION     = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+    REPORT_PATH    = "/reports/drift-report.json"
+    POLL_INTERVAL  = 300   # check every 5 minutes
+
+    USE_GROQ = bool(GROQ_API_KEY)
+    log.info("AI backend: %s", "Groq API (llama3-70b)" if USE_GROQ else "Ollama (llama3.2 local)")
+
+    # ── Prompt (same regardless of backend) ───────────────────
+    SYSTEM_PROMPT = """You are a Cloud Infrastructure Security and Compliance expert
+    specialising in AWS, ISO 22301 Business Continuity, and NIST SP 800-34.
+    Always respond with valid JSON only — no markdown, no explanation outside the JSON."""
+
+    def build_user_prompt(drift_data):
+        return f"""Analyze this AWS infrastructure drift report and return a JSON object with exactly these fields:
+    {{
+      "risk_level": "CRITICAL|HIGH|MEDIUM|LOW",
+      "drifted_count": <integer>,
+      "summary": "<2 sentences describing what drifted and why it matters>",
+      "top_risks": [
+        {{"resource": "<resource id>", "issue": "<what changed>", "remediation": "<fix command or step>"}}
+      ],
+      "compliance_impact": "<which ISO 22301 or NIST SP 800-34 controls are violated, or NONE>",
+      "auto_remediation_possible": true|false
+    }}
+
+    Drift Report (truncated to 3000 chars):
+    {json.dumps(drift_data, indent=2)[:3000]}"""
+
+    # ── AI call: Groq ─────────────────────────────────────────
+    def call_groq(drift_data):
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": build_user_prompt(drift_data)}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 1024,
+            "response_format": {"type": "json_object"}   # Groq guarantees valid JSON
+        }
+        log.info("Calling Groq API (model: %s)...", GROQ_MODEL)
+        resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        return json.loads(content)
+
+    # ── AI call: Ollama (fallback) ─────────────────────────────
+    def call_ollama(drift_data):
+        prompt = SYSTEM_PROMPT + "\n\n" + build_user_prompt(drift_data)
+        log.info("Calling Ollama (model: %s) — this may take ~60s on CPU...", OLLAMA_MODEL)
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.1}},
+            timeout=180
+        )
+        resp.raise_for_status()
+        raw = resp.json()["response"]
+        # Ollama sometimes wraps JSON in markdown code blocks — strip them
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+
+    # ── Main analysis dispatcher ──────────────────────────────
+    def analyze_with_ai(drift_data):
+        try:
+            if USE_GROQ:
+                return call_groq(drift_data)
+            else:
+                return call_ollama(drift_data)
+        except Exception as e:
+            log.error("AI analysis failed: %s", e)
+            return {
+                "risk_level": "UNKNOWN",
+                "drifted_count": len(drift_data.get("differences", [])),
+                "summary": f"AI analysis failed ({type(e).__name__}): {e}. Manual review required.",
+                "top_risks": [],
+                "compliance_impact": "UNKNOWN — manual review required",
+                "auto_remediation_possible": False
+            }
+
+    # ── Output: Slack ─────────────────────────────────────────
+    def send_slack(analysis):
+        if not SLACK_WEBHOOK:
+            return
+        color = {"CRITICAL": "danger", "HIGH": "warning", "MEDIUM": "warning",
+                 "LOW": "good", "UNKNOWN": "danger"}.get(analysis.get("risk_level"), "warning")
+        risks_text = "\n".join(
+            f"• *{r['resource']}*: {r['issue']} → {r['remediation']}"
+            for r in analysis.get("top_risks", [])
+        ) or "No specific risks identified"
+        backend = "Groq llama3-70b" if USE_GROQ else "Ollama llama3.2"
+        payload = {
+            "attachments": [{
+                "color": color,
+                "title": f"[Drift Detection] Risk Level: {analysis.get('risk_level', 'UNKNOWN')}",
+                "text": analysis.get("summary", "No summary"),
+                "fields": [
+                    {"title": "Drifted Resources", "value": str(analysis.get("drifted_count", 0)), "short": True},
+                    {"title": "Auto-Remediation", "value": str(analysis.get("auto_remediation_possible", False)), "short": True},
+                    {"title": "Compliance Impact", "value": analysis.get("compliance_impact", "Unknown"), "short": False},
+                    {"title": "Top Risks", "value": risks_text, "short": False}
+                ],
+                "footer": f"AI: {backend} | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+            }]
+        }
+        requests.post(SLACK_WEBHOOK, json=payload, timeout=10)
+        log.info("Slack notification sent")
+
+    # ── Output: OpenSearch ────────────────────────────────────
+    def index_to_opensearch(analysis, raw_drift):
+        if not OPENSEARCH_URL:
+            return
+        doc = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ai_backend": "groq" if USE_GROQ else "ollama",
+            "ai_analysis": analysis,
+            "raw_drift_summary": {
+                "total_drifted": len(raw_drift.get("differences", [])),
+                "scan_time": raw_drift.get("scanDuration", "unknown")
+            }
+        }
+        try:
+            requests.post(
+                f"{OPENSEARCH_URL}/drift-reports/_doc",
+                json=doc, timeout=10,
+                auth=("admin", os.getenv("OPENSEARCH_PASSWORD", "Admin@DR2024!"))
+            )
+            log.info("Indexed drift report to OpenSearch")
+        except Exception as e:
+            log.warning("OpenSearch indexing failed: %s", e)
+
+    # ── Output: SNS (CRITICAL/HIGH only) ─────────────────────
+    def send_sns(analysis):
+        if not SNS_TOPIC_ARN:
+            return
+        if analysis.get("risk_level") not in ("CRITICAL", "HIGH"):
+            return
+        boto3.client("sns", region_name=AWS_REGION).publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=f"[Drift Alert] {analysis['risk_level']} risk — {analysis.get('drifted_count',0)} resources drifted",
+            Message=(
+                f"Risk Level: {analysis['risk_level']}\n\n"
+                f"Summary: {analysis.get('summary', '')}\n\n"
+                f"Compliance Impact: {analysis.get('compliance_impact', '')}\n\n"
+                f"Top Risks:\n" +
+                "\n".join(f"  - {r['resource']}: {r['issue']}" for r in analysis.get("top_risks", []))
+            )
+        )
+        log.info("SNS alert sent for %s risk", analysis["risk_level"])
+
+    # ── Main loop ─────────────────────────────────────────────
+    def main():
+        log.info("AI Drift Analyzer started")
+        log.info("Backend: %s", "Groq API (llama3-70b-8192)" if USE_GROQ else "Ollama local")
+        log.info("Polling every %ds for new drift reports at %s", POLL_INTERVAL, REPORT_PATH)
+        last_mtime = None
+
+        while True:
+            try:
+                if os.path.exists(REPORT_PATH):
+                    mtime = os.path.getmtime(REPORT_PATH)
+                    if mtime != last_mtime:
+                        log.info("New drift report detected — analysing...")
+                        with open(REPORT_PATH) as f:
+                            drift_data = json.load(f)
+
+                        drifted = len(drift_data.get("differences", []))
+                        log.info("Drifted resources: %d", drifted)
+
+                        if drifted > 0:
+                            analysis = analyze_with_ai(drift_data)
+                            log.info("Analysis complete: risk=%s, drifted=%s",
+                                     analysis.get("risk_level"), analysis.get("drifted_count"))
+                            send_slack(analysis)
+                            index_to_opensearch(analysis, drift_data)
+                            send_sns(analysis)
+                        else:
+                            log.info("No drift detected — infrastructure matches Terraform state")
+
+                        last_mtime = mtime
+                else:
+                    log.debug("Waiting for drift report at %s", REPORT_PATH)
+            except Exception as e:
+                log.error("Analyzer loop error: %s", e, exc_info=True)
+
+            time.sleep(POLL_INTERVAL)
+
+    if __name__ == "__main__":
+        main()
