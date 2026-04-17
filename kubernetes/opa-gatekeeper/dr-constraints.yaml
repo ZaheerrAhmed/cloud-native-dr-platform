@@ -1,0 +1,39 @@
+---
+# OPA Gatekeeper ConstraintTemplate — enforce DR readiness policies
+# Ensures all deployments have resource limits and liveness probes (ISO 22301)
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: drresourcerequired
+spec:
+  crd:
+    spec:
+      names:
+        kind: DRResourceRequired
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package drresourcerequired
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.resources.limits.memory
+          msg := sprintf("Container '%v' missing memory limit (DR policy: all containers must have limits)", [container.name])
+        }
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.livenessProbe
+          msg := sprintf("Container '%v' missing livenessProbe (DR policy: probes required for health check routing)", [container.name])
+        }
+---
+apiVersion: drresourcerequired.constraints.gatekeeper.sh/v1beta1
+kind: DRResourceRequired
+metadata:
+  name: require-resource-limits
+spec:
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment"]
+    namespaces:
+      - dr-app
+  enforcementAction: warn   # use "deny" in production

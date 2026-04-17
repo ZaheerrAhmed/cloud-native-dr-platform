@@ -1,0 +1,36 @@
+all:
+  children:
+    jenkins:
+      hosts:
+        jenkins-server:
+          ansible_host: "127.0.0.1"      # runs locally on your Ubuntu VM
+          ansible_connection: local       # no SSH needed — runs on this machine
+          ansible_user: "{{ ansible_user_id }}"
+
+    # EKS nodes are managed via kubectl, not direct SSH
+    # These groups are for any EC2 bastion or monitoring nodes
+    bastion:
+      hosts:
+        bastion-primary:
+          ansible_host: "{{ bastion_primary_ip }}"
+          ansible_user: ec2-user
+          ansible_ssh_private_key_file: ~/.ssh/dr-platform.pem
+          region: us-east-1
+
+        bastion-dr:
+          ansible_host: "{{ bastion_dr_ip }}"
+          ansible_user: ec2-user
+          ansible_ssh_private_key_file: ~/.ssh/dr-platform.pem
+          region: us-west-2
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    project_name: dr-platform
+    primary_region: us-east-1
+    dr_region: us-west-2
+    eks_cluster_primary: dr-platform-primary-eks
+    eks_cluster_dr: dr-platform-dr-eks
+    velero_namespace: velero
+    app_namespace: dr-app
+    monitoring_namespace: monitoring
+    logging_namespace: logging

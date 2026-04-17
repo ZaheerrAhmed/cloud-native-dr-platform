@@ -1,0 +1,95 @@
+---
+# ============================================================
+# failover.yaml — Ansible DR Failover Playbook
+# Used by Rundeck or triggered manually when Lambda is bypassed
+# Run: ansible-playbook -i inventory/hosts.yaml playbooks/failover.yaml
+#        -e "failover_reason=primary_region_down"
+# ============================================================
+- name: Execute DR Failover
+  hosts: jenkins
+  vars:
+    failover_reason: "unspecified"
+    dr_region: "us-west-2"
+    primary_region: "us-east-1"
+    dr_eks_cluster: "dr-platform-dr-eks"
+    dr_rds_id: "dr-platform-dr-postgres-replica"
+    dr_eks_nodegroup: "dr-platform-dr-eks-workers"
+    sns_topic_arn: "{{ lookup('env', 'SNS_TOPIC_ARN') }}"
+
+  tasks:
+
+    - name: Record failover start time
+      set_fact:
+        failover_start: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Notify team — failover starting
+      shell: |
+        aws sns publish \
+          --region {{ primary_region }} \
+          --topic-arn {{ sns_topic_arn }} \
+          --subject "[DR] Failover initiated by Ansible" \
+          --message "Failover started at {{ failover_start }}. Reason: {{ failover_reason }}"
+
+    - name: Promote RDS read replica to standalone primary
+      shell: |
+        aws rds promote-read-replica \
+          --region {{ dr_region }} \
+          --db-instance-identifier {{ dr_rds_id }} \
+          --backup-retention-period 7
+      register: rds_promote
+      ignore_errors: true
+
+    - name: Wait for RDS to be available
+      shell: |
+        aws rds wait db-instance-available \
+          --region {{ dr_region }} \
+          --db-instance-identifier {{ dr_rds_id }}
+      when: rds_promote.rc == 0
+      timeout: 600
+
+    - name: Scale up DR EKS node group
+      shell: |
+        aws eks update-nodegroup-config \
+          --region {{ dr_region }} \
+          --cluster-name {{ dr_eks_cluster }} \
+          --nodegroup-name {{ dr_eks_nodegroup }} \
+          --scaling-config minSize=2,maxSize=4,desiredSize=3
+
+    - name: Wait for DR EKS nodes to be Ready
+      shell: |
+        aws eks update-kubeconfig --region {{ dr_region }} --name {{ dr_eks_cluster }}
+        kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+    - name: Verify DR application health
+      shell: |
+        aws eks update-kubeconfig --region {{ dr_region }} --name {{ dr_eks_cluster }}
+        kubectl rollout status deployment/dr-status-monitor -n dr-app --timeout=180s
+        DR_LB=$(kubectl get svc dr-status-monitor-svc -n dr-app \
+          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+        sleep 20
+        STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://${DR_LB}/health)
+        echo "DR app health check: HTTP $STATUS"
+        test "$STATUS" = "200"
+      register: dr_health
+
+    - name: Calculate RTO
+      set_fact:
+        failover_end: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Notify team — failover complete
+      shell: |
+        aws sns publish \
+          --region {{ primary_region }} \
+          --topic-arn {{ sns_topic_arn }} \
+          --subject "[DR] Failover COMPLETE" \
+          --message "Failover completed. Started: {{ failover_start }}. Reason: {{ failover_reason }}. DR cluster is now active in {{ dr_region }}."
+      when: dr_health.rc == 0
+
+    - name: Failover summary
+      debug:
+        msg:
+          - "Failover completed successfully"
+          - "Start: {{ failover_start }}"
+          - "End: {{ failover_end }}"
+          - "Reason: {{ failover_reason }}"
+          - "DR Region: {{ dr_region }}"

@@ -1,0 +1,170 @@
+# ============================================================
+# kube-prometheus-stack Helm values
+# Deploys: Prometheus, Grafana, Alertmanager, node-exporter
+# helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#   -n monitoring -f this-file.yaml --wait
+# ============================================================
+
+nameOverride: kps
+fullnameOverride: kube-prometheus-stack
+
+# ── Prometheus ──────────────────────────────────────────────
+prometheus:
+  prometheusSpec:
+    retention: 15d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp2
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 50Gi
+
+    # Scrape DR Status Monitor app
+    additionalScrapeConfigs:
+      - job_name: dr-status-monitor
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [dr-app]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+
+    # Alerting rules for DR readiness
+    additionalPrometheusRulesMap:
+      dr-platform-rules:
+        groups:
+          - name: dr.platform.health
+            rules:
+              - alert: AppDown
+                expr: up{job="dr-status-monitor"} == 0
+                for: 1m
+                labels:
+                  severity: critical
+                annotations:
+                  summary: "DR Status Monitor is down"
+                  description: "The DR platform application has been unreachable for 1 minute — potential failover required"
+
+              - alert: DatabaseUnreachable
+                expr: probe_success{job="dr-db-probe"} == 0
+                for: 2m
+                labels:
+                  severity: critical
+                annotations:
+                  summary: "PostgreSQL database unreachable"
+                  description: "Database connectivity lost — checking replication status"
+
+              - alert: NodeMemoryHigh
+                expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+                for: 5m
+                labels:
+                  severity: warning
+                annotations:
+                  summary: "Node memory usage above 85%"
+
+              - alert: PodCrashLooping
+                expr: rate(kube_pod_container_status_restarts_total[5m]) * 60 * 5 > 5
+                for: 2m
+                labels:
+                  severity: warning
+                annotations:
+                  summary: "Pod is crash-looping"
+                  description: "{{ $labels.pod }} in {{ $labels.namespace }} is restarting frequently"
+
+              - alert: VeleroBackupFailed
+                expr: velero_backup_failure_total > 0
+                for: 1m
+                labels:
+                  severity: critical
+                annotations:
+                  summary: "Velero backup failure detected"
+                  description: "Kubernetes backup failed — RPO SLA at risk"
+
+# ── Alertmanager ────────────────────────────────────────────
+alertmanager:
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: [alertname, severity]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: default
+      routes:
+        - match:
+            severity: critical
+          receiver: pagerduty-critical
+        - match:
+            severity: warning
+          receiver: slack-warnings
+
+    receivers:
+      - name: default
+        slack_configs:
+          - api_url: "https://hooks.slack.com/services/REPLACE_WITH_YOUR_WEBHOOK"
+            channel: "#dr-alerts"
+            title: '[{{ .Status | toUpper }}] {{ .CommonAnnotations.summary }}'
+            text: "{{ .CommonAnnotations.description }}"
+
+      - name: pagerduty-critical
+        pagerduty_configs:
+          - routing_key: "REPLACE_WITH_PAGERDUTY_KEY"
+            description: "{{ .CommonAnnotations.summary }}"
+            severity: critical
+
+      - name: slack-warnings
+        slack_configs:
+          - api_url: "https://hooks.slack.com/services/REPLACE_WITH_YOUR_WEBHOOK"
+            channel: "#dr-warnings"
+            title: '[WARNING] {{ .CommonAnnotations.summary }}'
+
+# ── Grafana ─────────────────────────────────────────────────
+grafana:
+  adminPassword: "Admin@DR2024!"   # change before production; same as OpenSearch default
+  service:
+    type: LoadBalancer
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClassName: gp2
+
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          folder: DR Platform
+          type: file
+          options:
+            path: /var/lib/grafana/dashboards
+
+  dashboards:
+    default:
+      kubernetes-cluster:
+        gnetId: 7249
+        revision: 1
+        datasource: Prometheus
+      node-exporter:
+        gnetId: 1860
+        revision: 37
+        datasource: Prometheus
+      velero:
+        gnetId: 16829
+        revision: 2
+        datasource: Prometheus
+
+# ── Node Exporter ───────────────────────────────────────────
+nodeExporter:
+  enabled: true
+
+# ── Kube State Metrics ──────────────────────────────────────
+kubeStateMetrics:
+  enabled: true

@@ -1,0 +1,100 @@
+---
+# driftctl CronJob — runs every 6 hours, outputs JSON report
+# Results are consumed by the AI Analyzer deployment
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: drift-detection
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: driftctl-config
+  namespace: drift-detection
+data:
+  scan.sh: |
+    #!/bin/sh
+    set -e
+    echo "Starting driftctl scan at $(date)"
+
+    driftctl scan \
+      --output json:///reports/drift-report.json \
+      --from tfstate+s3://${TFSTATE_BUCKET}/primary/terraform.tfstate
+
+    DRIFTED=$(cat /reports/drift-report.json | jq '.differences | length')
+    echo "Scan complete. Drifted resources: $DRIFTED"
+
+    # Signal AI analyzer that new report is ready
+    touch /reports/scan-complete
+    echo "Report saved to /reports/drift-report.json"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: driftctl-scanner
+  namespace: drift-detection
+spec:
+  schedule: "0 */6 * * *"    # every 6 hours
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: drift-detection-sa
+          # Co-locate with the AI Analyzer so they share the same ReadWriteOnce PVC node.
+          # Without this, the CronJob pod may land on a different node and fail to mount
+          # the PVC that the AI Analyzer already has bound to its node.
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: ai-drift-analyzer
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: driftctl
+              image: snyk/driftctl:latest
+              command: ["/bin/sh", "/config/scan.sh"]
+              env:
+                - name: AWS_DEFAULT_REGION
+                  value: "us-east-1"
+                - name: TFSTATE_BUCKET
+                  value: "dr-platform-tfstate-primary"
+              volumeMounts:
+                - name: reports
+                  mountPath: /reports
+                - name: config
+                  mountPath: /config
+          volumes:
+            - name: reports
+              persistentVolumeClaim:
+                claimName: drift-reports-pvc   # shared with ai-analyzer
+            - name: config
+              configMap:
+                name: driftctl-config
+                defaultMode: 0755
+---
+# Shared volume between CronJob (writer) and AI Analyzer (reader)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: drift-reports-pvc
+  namespace: drift-detection
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: gp2
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: drift-detection-sa
+  namespace: drift-detection
+  annotations:
+    # Role ARN is patched by Ansible deploy-k8s-tools.yaml after Terraform outputs it
+    eks.amazonaws.com/role-arn: "PATCH_BY_ANSIBLE"

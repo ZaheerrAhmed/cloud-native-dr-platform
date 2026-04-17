@@ -1,0 +1,219 @@
+---
+# ============================================================
+# deploy-k8s-tools.yaml
+# Deploys all Kubernetes tools to the target EKS cluster:
+#   Prometheus+Grafana, OpenSearch SIEM, Velero, ArgoCD, OPA
+# Run: ansible-playbook -i inventory/hosts.yaml playbooks/deploy-k8s-tools.yaml
+#        -e "cluster_name=dr-platform-primary-eks" -e "region=us-east-1"
+# ============================================================
+- name: Deploy Kubernetes tools to EKS cluster
+  hosts: jenkins
+  become_user: "{{ ansible_user }}"
+  vars:
+    cluster_name:   "dr-platform-primary-eks"
+    region:         "us-east-1"
+    velero_bucket:  "dr-platform-primary-velero-primary"
+    velero_role_arn: ""    # set via -e or vars file
+
+  tasks:
+
+    - name: Configure kubectl for cluster
+      shell: >
+        aws eks update-kubeconfig
+        --region {{ region }}
+        --name {{ cluster_name }}
+
+    # ── Helm repos (must be added before any helm install) ──
+    - name: Add Helm repositories
+      shell: |
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+        helm repo add opensearch             https://opensearch-project.github.io/helm-charts
+        helm repo add fluent                 https://fluent.github.io/helm-charts
+        helm repo add argo                   https://argoproj.github.io/argo-helm
+        helm repo add opa                    https://open-policy-agent.github.io/gatekeeper/charts
+        helm repo add aws                    https://aws.github.io/eks-charts
+        helm repo update
+      changed_when: false
+
+    # ── Namespaces ──────────────────────────────────────────
+    - name: Create namespaces
+      shell: kubectl create namespace {{ item }} --dry-run=client -o yaml | kubectl apply -f -
+      loop:
+        - monitoring
+        - logging
+        - velero
+        - argocd
+        - dr-app
+        - opa-system
+
+    # ── AWS Load Balancer Controller ────────────────────────
+    - name: Install AWS Load Balancer Controller
+      shell: |
+        helm upgrade --install aws-load-balancer-controller aws/aws-load-balancer-controller \
+          -n kube-system \
+          --set clusterName={{ cluster_name }} \
+          --set serviceAccount.create=true \
+          --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="{{ lb_controller_role_arn }}" \
+          --wait
+
+    # ── Prometheus + Grafana (kube-prometheus-stack) ────────
+    - name: Deploy kube-prometheus-stack
+      shell: |
+        helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+          -n monitoring \
+          -f {{ playbook_dir }}/../../kubernetes/monitoring/kube-prometheus-stack-values.yaml \
+          --wait --timeout 10m
+
+    # ── OpenSearch (SIEM / centralized logging) ─────────────
+    - name: Deploy OpenSearch
+      shell: |
+        # Primary: 2 replicas. DR: 1 replica (single node, not enough RAM for 2)
+        OPENSEARCH_REPLICAS={{ (region == 'us-east-1') | ternary('2','1') }}
+        helm upgrade --install opensearch opensearch/opensearch \
+          -n logging \
+          -f {{ playbook_dir }}/../../kubernetes/logging/opensearch-values.yaml \
+          --set replicas=$OPENSEARCH_REPLICAS \
+          --wait --timeout 10m
+
+    - name: Deploy OpenSearch Dashboards
+      shell: |
+        helm upgrade --install opensearch-dashboards opensearch/opensearch-dashboards \
+          -n logging \
+          --set service.type=LoadBalancer \
+          --wait
+
+    # ── Fluent Bit (log shipping to OpenSearch) ──────────────
+    - name: Deploy Fluent Bit
+      shell: |
+        helm upgrade --install fluent-bit fluent/fluent-bit \
+          -n logging \
+          -f {{ playbook_dir }}/../../kubernetes/logging/fluent-bit-values.yaml \
+          --set env[0].name=CLUSTER_NAME,env[0].value={{ cluster_name }} \
+          --set env[1].name=AWS_REGION,env[1].value={{ region }} \
+          --wait
+
+    # ── Velero (backup + restore) ────────────────────────────
+    - name: Deploy Velero
+      shell: |
+        velero install \
+          --provider aws \
+          --plugins velero/velero-plugin-for-aws:v1.10.0 \
+          --bucket {{ velero_bucket }} \
+          --backup-location-config region={{ region }} \
+          --snapshot-location-config region={{ region }} \
+          --sa-annotations "eks.amazonaws.com/role-arn={{ velero_role_arn }}" \
+          --no-secret \
+          --wait
+
+    - name: Apply Velero backup schedules
+      shell: kubectl apply -f {{ playbook_dir }}/../../kubernetes/velero/backup-schedule.yaml
+
+    # ── ArgoCD ──────────────────────────────────────────────
+    - name: Deploy ArgoCD
+      shell: |
+        helm upgrade --install argocd argo/argo-cd \
+          -n argocd \
+          --set server.service.type=LoadBalancer \
+          --wait --timeout 10m
+
+    - name: Apply ArgoCD App-of-Apps
+      shell: kubectl apply -f {{ playbook_dir }}/../../kubernetes/argocd/app-of-apps.yaml
+
+    # ── OPA Gatekeeper ──────────────────────────────────────
+    - name: Deploy OPA Gatekeeper
+      shell: |
+        helm upgrade --install gatekeeper opa/gatekeeper \
+          -n opa-system \
+          --wait
+
+    - name: Apply OPA DR constraints
+      shell: kubectl apply -f {{ playbook_dir }}/../../kubernetes/opa-gatekeeper/dr-constraints.yaml
+
+    # ── Drift Detection (driftctl + AI Analyzer) ─────────────
+    # Deploy driftctl CronJob + AI Analyzer (uses Groq if key set, else Ollama)
+    - name: Deploy drift detection (CronJob + AI Analyzer)
+      shell: |
+        kubectl apply -f {{ playbook_dir }}/../../kubernetes/drift-detection/driftctl-cronjob.yaml
+        kubectl apply -f {{ playbook_dir }}/../../kubernetes/drift-detection/ai-analyzer-deployment.yaml
+
+    # Only deploy Ollama if no Groq API key provided (Ollama needs 3-4GB RAM extra)
+    - name: Deploy Ollama (only when no Groq API key)
+      shell: kubectl apply -f {{ playbook_dir }}/../../kubernetes/drift-detection/ollama-deployment.yaml
+      when: groq_api_key | default('') == ''
+
+    - name: Patch drift-detection service account with IAM role ARN
+      shell: |
+        kubectl annotate serviceaccount drift-detection-sa \
+          -n drift-detection \
+          eks.amazonaws.com/role-arn="{{ drift_detection_role_arn }}" \
+          --overwrite
+      when: drift_detection_role_arn | default('') != ''   # skip when empty (e.g. DR cluster)
+
+    # ── Secrets: pull DB credentials from AWS Secrets Manager ──
+    # This creates the K8s secret the app reads at startup
+    - name: Fetch DB credentials from Secrets Manager and create K8s secret
+      shell: |
+        SECRET_JSON=$(aws secretsmanager get-secret-value \
+          --region {{ region }} \
+          --secret-id "{{ cluster_name | replace('-eks','') }}-postgres-db-password" \
+          --query SecretString --output text)
+
+        DB_HOST=$(echo $SECRET_JSON | python3 -c "import sys,json; print(json.load(sys.stdin)['host'])")
+        DB_USER=$(echo $SECRET_JSON | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
+        DB_PASS=$(echo $SECRET_JSON | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
+
+        kubectl create secret generic db-credentials \
+          --namespace dr-app \
+          --from-literal=host="$DB_HOST" \
+          --from-literal=username="$DB_USER" \
+          --from-literal=password="$DB_PASS" \
+          --dry-run=client -o yaml | kubectl apply -f -
+      no_log: true    # never print DB password to logs
+
+    # ── Secrets: create dr-secrets for drift analyzer ──────
+    # groq_api_key: free key from https://console.groq.com (2-minute signup)
+    # If not set, AI falls back to Ollama (self-hosted, needs more RAM)
+    - name: Create dr-secrets for drift detection
+      shell: |
+        SNS_ARN="{{ sns_topic_arn | default('') }}"
+        SLACK_URL="{{ slack_webhook | default('') }}"
+        GROQ_KEY="{{ groq_api_key | default('') }}"
+
+        kubectl create secret generic dr-secrets \
+          --namespace drift-detection \
+          --from-literal=sns_topic_arn="$SNS_ARN" \
+          --from-literal=slack_webhook="$SLACK_URL" \
+          --from-literal=groq_api_key="$GROQ_KEY" \
+          --dry-run=client -o yaml | kubectl apply -f -
+      no_log: true
+
+    # ── Secrets: OpenSearch password for Fluent Bit ─────────
+    - name: Create OpenSearch password secret for Fluent Bit
+      shell: |
+        kubectl create secret generic opensearch-credentials \
+          --namespace logging \
+          --from-literal=password="{{ opensearch_password | default('Admin@DR2024!') }}" \
+          --dry-run=client -o yaml | kubectl apply -f -
+      no_log: true
+
+    # ── Application ─────────────────────────────────────────
+    - name: Deploy DR Status Monitor application
+      shell: kubectl apply -f {{ playbook_dir }}/../../kubernetes/app/
+
+    - name: Wait for application to be ready
+      shell: kubectl rollout status deployment/dr-status-monitor -n dr-app --timeout=120s
+
+    - name: Show deployed resources
+      shell: |
+        echo "=== Nodes ===" && kubectl get nodes
+        echo "=== Pods (monitoring) ===" && kubectl get pods -n monitoring
+        echo "=== Pods (logging) ===" && kubectl get pods -n logging
+        echo "=== Pods (velero) ===" && kubectl get pods -n velero
+        echo "=== Pods (argocd) ===" && kubectl get pods -n argocd
+        echo "=== Pods (dr-app) ===" && kubectl get pods -n dr-app
+      register: status
+      changed_when: false
+
+    - name: Show cluster status
+      debug:
+        msg: "{{ status.stdout_lines }}"
