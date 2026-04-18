@@ -102,7 +102,8 @@ ansible-playbook \
   -e "drift_detection_role_arn=$(cd terraform/primary && terraform output -raw drift_detection_role_arn)" \
   -e "sns_topic_arn=$(cd terraform/primary && terraform output -raw sns_topic_arn)" \
   -e "opensearch_password=${OPENSEARCH_PASSWORD:-Admin@DR2024!}" \
-  -e "groq_api_key=${GROQ_API_KEY:-}"
+  -e "groq_api_key=${GROQ_API_KEY:-}" \
+  -e "slack_webhook=${SLACK_WEBHOOK:-}"
   # GROQ_API_KEY: free from https://console.groq.com (optional — AI falls back to Ollama if not set)
 
 echo ""

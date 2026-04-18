@@ -115,7 +115,8 @@ ansible-playbook \
   -e "drift_detection_role_arn=" \
   -e "sns_topic_arn=${PRIMARY_SNS_ARN:-}" \
   -e "opensearch_password=${OPENSEARCH_PASSWORD:-Admin@DR2024!}" \
-  -e "groq_api_key=${GROQ_API_KEY:-}"
+  -e "groq_api_key=${GROQ_API_KEY:-}" \
+  -e "slack_webhook=${SLACK_WEBHOOK:-}"
 
 # Update ConfigMap region/environment for DR cluster
 kubectl patch configmap dr-app-config -n dr-app \

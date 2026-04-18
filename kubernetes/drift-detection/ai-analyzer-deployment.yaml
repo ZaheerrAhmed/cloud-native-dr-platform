@@ -65,6 +65,11 @@ spec:
                 secretKeyRef:
                   name: dr-secrets
                   key: slack_webhook
+            - name: OPENSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dr-secrets
+                  key: opensearch_password
           volumeMounts:
             - name: analyzer-script
               mountPath: /app
@@ -250,7 +255,7 @@ data:
             requests.post(
                 f"{OPENSEARCH_URL}/drift-reports/_doc",
                 json=doc, timeout=10,
-                auth=("admin", os.getenv("OPENSEARCH_PASSWORD", "Admin@DR2024!"))
+                auth=("admin", os.environ["OPENSEARCH_PASSWORD"])
             )
             log.info("Indexed drift report to OpenSearch")
         except Exception as e:

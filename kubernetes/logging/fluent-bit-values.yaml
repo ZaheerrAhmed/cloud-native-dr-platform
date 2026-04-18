@@ -71,7 +71,7 @@ config:
         Index           dr-platform-logs
         Type            _doc
         HTTP_User       admin
-        HTTP_Passwd     Admin@DR2024!
+        HTTP_Passwd     ${OPENSEARCH_PASSWORD}
         tls             Off
         Replace_Dots    On
         Retry_Limit     5
@@ -80,10 +80,18 @@ config:
     [OUTPUT]
         Name              cloudwatch_logs
         Match             kube.*
-        region            us-east-1
-        log_group_name    /eks/dr-platform-primary/application
+        region            ${AWS_REGION}
+        log_group_name    ${LOG_GROUP_NAME}
         log_stream_prefix pod/
         auto_create_group true
+
+# Environment variables (CLUSTER_NAME, AWS_REGION, LOG_GROUP_NAME injected via --set by Ansible)
+env:
+  - name: OPENSEARCH_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: opensearch-credentials
+        key: password
 
 tolerations:
   - key: node-role.kubernetes.io/master

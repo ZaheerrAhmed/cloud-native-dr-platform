@@ -88,8 +88,9 @@
         helm upgrade --install fluent-bit fluent/fluent-bit \
           -n logging \
           -f {{ playbook_dir }}/../../kubernetes/logging/fluent-bit-values.yaml \
-          --set env[0].name=CLUSTER_NAME,env[0].value={{ cluster_name }} \
-          --set env[1].name=AWS_REGION,env[1].value={{ region }} \
+          --set-string env[1].name=CLUSTER_NAME,env[1].value={{ cluster_name }} \
+          --set-string env[2].name=AWS_REGION,env[2].value={{ region }} \
+          --set-string env[3].name=LOG_GROUP_NAME,env[3].value=/eks/{{ cluster_name }}/application \
           --wait
 
     # ── Velero (backup + restore) ────────────────────────────
@@ -184,6 +185,7 @@
           --from-literal=sns_topic_arn="$SNS_ARN" \
           --from-literal=slack_webhook="$SLACK_URL" \
           --from-literal=groq_api_key="$GROQ_KEY" \
+          --from-literal=opensearch_password="{{ opensearch_password | default('Admin@DR2024!') }}" \
           --dry-run=client -o yaml | kubectl apply -f -
       no_log: true
 
