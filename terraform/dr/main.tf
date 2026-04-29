@@ -51,33 +51,29 @@ module "eks" {
   tags                = local.common_tags
 }
 
-# RDS PostgreSQL Read Replica — promoted to primary on failover
-module "rds_replica" {
-  source         = "../modules/rds"
-  identifier     = "${local.name}-postgres"
-  vpc_id         = module.vpc.vpc_id
-  vpc_cidr       = module.vpc.vpc_cidr
-  subnet_ids     = module.vpc.private_subnet_ids
-  instance_class = "db.t3.medium"
-  multi_az       = false           # not needed until promoted
-  deletion_protection = false      # allow destroy in DR env
-  is_replica     = true
-  source_db_arn  = var.primary_db_arn
-  tags           = local.common_tags
+# KMS key required for cross-region encrypted read replica
+resource "aws_kms_key" "rds_dr" {
+  description             = "RDS encryption key for DR read replica"
+  deletion_window_in_days = 14
+  enable_key_rotation     = true
+  tags                    = local.common_tags
 }
 
-# ECR Pull-Through Cache — DR cluster pulls images via replication
-resource "aws_ecr_replication_configuration" "main" {
-  replication_configuration {
-    rule {
-      destination {
-        region      = var.dr_region
-        registry_id = var.aws_account_id
-      }
-      repository_filter {
-        filter      = "dr-platform"
-        filter_type = "PREFIX_MATCH"
-      }
-    }
-  }
+# RDS PostgreSQL Read Replica — promoted to primary on failover
+module "rds_replica" {
+  source              = "../modules/rds"
+  identifier          = "${local.name}-postgres"
+  vpc_id              = module.vpc.vpc_id
+  vpc_cidr            = module.vpc.vpc_cidr
+  subnet_ids          = module.vpc.private_subnet_ids
+  instance_class      = "db.t3.small"
+  multi_az            = false
+  deletion_protection = false
+  is_replica          = true
+  source_db_arn       = var.primary_db_arn
+  replica_kms_key_id  = aws_kms_key.rds_dr.arn
+  tags                = local.common_tags
 }
+
+# DR cluster pulls images directly from primary ECR (cross-region IAM access via node role)
+# No ECR replication needed — same account, IAM allows cross-region pulls

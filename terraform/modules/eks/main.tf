@@ -41,7 +41,7 @@ resource "aws_eks_node_group" "workers" {
 
   launch_template {
     name    = aws_launch_template.node.name
-    version = aws_launch_template.node.latest_version_number
+    version = aws_launch_template.node.default_version
   }
 
   tags = var.tags

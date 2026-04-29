@@ -48,6 +48,7 @@ module "s3_velero" {
   enable_replication                  = true
   replication_destination_bucket_arn  = aws_s3_bucket.velero_dr.arn
   tags                                = local.common_tags
+  depends_on                          = [aws_s3_bucket_versioning.velero_dr]
 }
 
 # ── ECR: Container registry for the voting app image ──────
@@ -64,7 +65,7 @@ resource "aws_ecr_lifecycle_policy" "app" {
     rules = [{
       rulePriority = 1
       description  = "Keep last 10 images"
-      selection    = { tagStatus = "any"; countType = "imageCountMoreThan"; countNumber = 10 }
+      selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 10 }
       action       = { type = "expire" }
     }]
   })
@@ -78,9 +79,9 @@ module "eks" {
   vpc_id               = module.vpc.vpc_id
   public_subnet_ids    = module.vpc.public_subnet_ids
   private_subnet_ids   = module.vpc.private_subnet_ids
-  node_instance_type   = "t3.large"   # needs headroom for Prometheus + OpenSearch
+  node_instance_type   = "t3.large"
   node_desired_size    = 2
-  node_max_size        = 4
+  node_max_size        = 3
   node_min_size        = 1
   velero_bucket_name   = module.s3_velero.bucket_name
   tags                 = local.common_tags
@@ -95,9 +96,9 @@ module "rds" {
   subnet_ids = module.vpc.private_subnet_ids
   db_name    = "drplatform"
   db_username                 = "dbadmin"
-  instance_class              = "db.t3.medium"
-  allocated_storage           = 50
-  multi_az                    = true
+  instance_class              = "db.t3.small"
+  allocated_storage           = 20
+  multi_az                    = false
   deletion_protection         = true
   backup_retention_days       = 7
   is_replica                  = false
@@ -204,13 +205,14 @@ module "route53" {
   dns_name            = var.domain_name
   primary_fqdn        = var.domain_name
   health_check_path   = "/health"
-  primary_alb_dns     = "PLACEHOLDER_PRIMARY_ALB"   # updated by Ansible post-deploy
-  primary_alb_zone_id = "Z35SXDOTRQ7X7K"            # us-east-1 ALB zone ID
-  dr_alb_dns          = "PLACEHOLDER_DR_ALB"         # updated by Ansible post-deploy
-  dr_alb_zone_id      = "Z1H1FL5HABSF5"             # us-west-2 ALB zone ID
+  primary_alb_dns     = var.primary_alb_dns
+  primary_alb_zone_id = "Z35SXDOTRQ7X7K"
+  dr_alb_dns          = var.dr_alb_dns
+  dr_alb_zone_id      = "Z1H1FL5HABSF5"
   sns_topic_arn       = aws_sns_topic.dr_alerts.arn
   failover_lambda_arn = aws_lambda_function.failover.arn
   alert_emails        = var.alert_emails
+  skip_dns_records    = var.hosted_zone_id == "PLACEHOLDER"
   tags                = local.common_tags
 }
 
@@ -233,7 +235,7 @@ resource "aws_config_delivery_channel" "main" {
 
 resource "aws_config_configuration_recorder_status" "main" {
   name       = aws_config_configuration_recorder.main.name
-  is_enabled = true
+  is_enabled = false
   depends_on = [aws_config_delivery_channel.main]
 }
 

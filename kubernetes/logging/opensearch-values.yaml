@@ -10,7 +10,7 @@ nodeGroup: master
 
 masterService: opensearch-cluster-master
 
-replicas: 2   # 1 in DR (standby), 2 in primary
+replicas: 1   # Single node for cost savings; scale to 2 for production
 
 # Storage
 persistence:
@@ -27,28 +27,20 @@ resources:
     cpu: 1000m
     memory: 2Gi
 
-# OpenSearch config
 opensearchJavaOpts: "-Xmx1g -Xms1g"
 
 config:
   opensearch.yml: |
     cluster.name: dr-platform-siem
     network.host: 0.0.0.0
-    plugins.security.disabled: false
-    plugins.security.ssl.http.enabled: false
-
-    # Index lifecycle for log retention
-    plugins.index_management.enabled: true
+    plugins.security.disabled: true
 
 extraEnvs:
-  - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
-    valueFrom:
-      secretKeyRef:
-        name: opensearch-credentials
-        key: password
+  - name: DISABLE_INSTALL_DEMO_CONFIG
+    value: "true"
+  - name: DISABLE_PERFORMANCE_ANALYZER_AGENT_CLI
+    value: "true"
 
 service:
   type: ClusterIP
   port: 9200
-
-# Index templates will be applied by Fluent Bit init job

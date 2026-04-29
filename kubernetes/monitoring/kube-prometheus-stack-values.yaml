@@ -37,6 +37,12 @@ prometheus:
             target_label: __metrics_path__
             regex: (.+)
 
+      # Scrape Velero backup metrics from its HTTP monitoring port
+      - job_name: velero
+        static_configs:
+          - targets: ["velero.velero.svc.cluster.local:8085"]
+        metrics_path: /metrics
+
     # Alerting rules for DR readiness
     additionalPrometheusRulesMap:
       dr-platform-rules:
@@ -98,33 +104,11 @@ alertmanager:
       group_interval: 5m
       repeat_interval: 4h
       receiver: default
-      routes:
-        - match:
-            severity: critical
-          receiver: pagerduty-critical
-        - match:
-            severity: warning
-          receiver: slack-warnings
-
     receivers:
       - name: default
-        slack_configs:
-          - api_url: "https://hooks.slack.com/services/REPLACE_WITH_YOUR_WEBHOOK"
-            channel: "#dr-alerts"
-            title: '[{{ .Status | toUpper }}] {{ .CommonAnnotations.summary }}'
-            text: "{{ .CommonAnnotations.description }}"
-
-      - name: pagerduty-critical
-        pagerduty_configs:
-          - routing_key: "REPLACE_WITH_PAGERDUTY_KEY"
-            description: "{{ .CommonAnnotations.summary }}"
-            severity: critical
-
-      - name: slack-warnings
-        slack_configs:
-          - api_url: "https://hooks.slack.com/services/REPLACE_WITH_YOUR_WEBHOOK"
-            channel: "#dr-warnings"
-            title: '[WARNING] {{ .CommonAnnotations.summary }}'
+        webhook_configs:
+          - url: "http://CHANGEME_ALERTMANAGER_WEBHOOK/"
+            send_resolved: true
 
 # ── Grafana ─────────────────────────────────────────────────
 grafana:
@@ -159,6 +143,22 @@ grafana:
       velero:
         gnetId: 16829
         revision: 2
+        datasource: Prometheus
+      kubernetes-views-pods:
+        gnetId: 15760
+        revision: 28
+        datasource: Prometheus
+      kubernetes-views-namespaces:
+        gnetId: 15758
+        revision: 35
+        datasource: Prometheus
+      kubernetes-views-global:
+        gnetId: 15757
+        revision: 37
+        datasource: Prometheus
+      kubernetes-pvc:
+        gnetId: 13032
+        revision: 1
         datasource: Prometheus
 
 # ── Node Exporter ───────────────────────────────────────────

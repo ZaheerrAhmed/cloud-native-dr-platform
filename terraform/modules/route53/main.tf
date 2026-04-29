@@ -3,14 +3,14 @@
 # When primary health check fails, traffic auto-routes to DR
 # ============================================================
 
-# Health check on primary ALB endpoint
+# Health check on primary ALB endpoint — uses real ALB DNS when available
 resource "aws_route53_health_check" "primary" {
-  fqdn              = var.primary_fqdn
+  fqdn              = var.primary_alb_dns != "PLACEHOLDER_PRIMARY_ALB" ? var.primary_alb_dns : var.primary_fqdn
   port              = 80
   type              = "HTTP"
   resource_path     = var.health_check_path
   failure_threshold = 3
-  request_interval  = 10   # fast detection — 30 seconds total to failover
+  request_interval  = 10
 
   tags = merge(var.tags, { Name = "${var.name}-primary-hc" })
 }
@@ -36,8 +36,9 @@ resource "aws_cloudwatch_metric_alarm" "primary_down" {
   tags = var.tags
 }
 
-# Primary DNS record — active when healthy
+# Primary DNS record — skipped when hosted_zone_id is a placeholder
 resource "aws_route53_record" "primary" {
+  count   = var.skip_dns_records ? 0 : 1
   zone_id = var.hosted_zone_id
   name    = var.dns_name
   type    = "A"
@@ -56,8 +57,9 @@ resource "aws_route53_record" "primary" {
   set_identifier  = "primary"
 }
 
-# DR DNS record — takes over automatically when primary fails
+# DR DNS record — skipped when hosted_zone_id is a placeholder
 resource "aws_route53_record" "dr" {
+  count   = var.skip_dns_records ? 0 : 1
   zone_id = var.hosted_zone_id
   name    = var.dns_name
   type    = "A"

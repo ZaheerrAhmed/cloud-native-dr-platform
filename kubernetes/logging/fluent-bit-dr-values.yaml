@@ -1,7 +1,7 @@
 # ============================================================
-# Fluent Bit Helm values — PRIMARY cluster (us-east-1)
-# For DR cluster use fluent-bit-dr-values.yaml
-# helm upgrade --install fluent-bit fluent/fluent-bit -n logging -f this-file.yaml
+# Fluent Bit Helm values — DR cluster (us-west-2)
+# helm upgrade --install fluent-bit fluent/fluent-bit -n logging \
+#   --kube-context dr -f this-file.yaml
 # ============================================================
 
 config:
@@ -44,9 +44,9 @@ config:
     [FILTER]
         Name   record_modifier
         Match  *
-        Record cluster_name  dr-platform-primary-eks
-        Record region        us-east-1
-        Record environment   primary
+        Record cluster_name  dr-platform-dr-eks
+        Record region        us-west-2
+        Record environment   dr
 
     [FILTER]
         Name   grep

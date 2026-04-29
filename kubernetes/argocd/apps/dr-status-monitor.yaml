@@ -1,10 +1,7 @@
-# Root application — watches kubernetes/argocd/apps/ in Git
-# ArgoCD deploys every Application manifest it finds there
-# Apply once: kubectl apply -f kubernetes/argocd/app-of-apps.yaml -n argocd
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: dr-platform-root
+  name: dr-status-monitor
   namespace: argocd
   finalizers:
     - resources-finalizer.argocd.argoproj.io
@@ -13,14 +10,13 @@ spec:
   source:
     repoURL: https://github.com/ZaheerrAhmed/cloud-native-dr-platform
     targetRevision: main
-    path: kubernetes/argocd/apps
+    path: kubernetes/app
   destination:
     server: https://kubernetes.default.svc
-    namespace: argocd
+    namespace: dr-app
   syncPolicy:
     automated:
       prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
-      - ServerSideApply=true
