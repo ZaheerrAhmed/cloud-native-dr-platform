@@ -25,7 +25,7 @@ spec:
           msg := sprintf("Container '%v' missing livenessProbe (DR policy: probes required for health check routing)", [container.name])
         }
 ---
-apiVersion: drresourcerequired.constraints.gatekeeper.sh/v1beta1
+apiVersion: constraints.gatekeeper.sh/v1beta1
 kind: DRResourceRequired
 metadata:
   name: require-resource-limits
