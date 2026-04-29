@@ -54,11 +54,7 @@ resource "aws_db_parameter_group" "postgres16" {
   }
   parameter {
     name  = "log_min_duration_statement"
-    value = "1000"  # log queries >1s
-  }
-  parameter {
-    name  = "wal_level"
-    value = "replica"
+    value = "1000"
   }
 
   tags = var.tags
@@ -135,6 +131,7 @@ resource "aws_db_instance" "replica" {
   replicate_source_db = var.source_db_arn
   instance_class      = var.instance_class
   storage_encrypted   = true
+  kms_key_id          = var.replica_kms_key_id != "" ? var.replica_kms_key_id : null
   publicly_accessible = false
   skip_final_snapshot = true
 

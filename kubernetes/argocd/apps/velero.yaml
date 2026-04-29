@@ -1,0 +1,32 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: velero
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  sources:
+    - repoURL: https://vmware-tanzu.github.io/helm-charts
+      chart: velero
+      targetRevision: "*"
+      helm:
+        valueFiles:
+          - $values/kubernetes/velero/velero-values.yaml
+        parameters:
+          - name: configuration.backupStorageLocation[0].bucket
+            value: dr-platform-primary-velero-primary
+          - name: configuration.backupStorageLocation[0].prefix
+            value: velero
+          - name: serviceAccount.server.annotations.eks\.amazonaws\.com/role-arn
+            value: arn:aws:iam::380093117517:role/dr-platform-primary-eks-velero-role
+    - repoURL: https://github.com/ZaheerrAhmed/cloud-native-dr-platform
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: velero
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true

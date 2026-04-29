@@ -1,14 +1,21 @@
 terraform {
   required_version = ">= 1.6.0"
   required_providers {
-    aws    = { source = "hashicorp/aws";    version = "~> 5.0" }
-    random = { source = "hashicorp/random"; version = "~> 3.0" }
-    tls    = { source = "hashicorp/tls";    version = "~> 4.0" }
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 }
 
-# NOTE: default_tags cannot reference locals (not available at provider init).
-# Tags are applied per-resource via tags = local.common_tags.
 provider "aws" {
   region = var.dr_region
 }

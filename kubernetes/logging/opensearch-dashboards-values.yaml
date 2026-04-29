@@ -1,0 +1,20 @@
+# ============================================================
+# OpenSearch Dashboards Helm values
+# helm install opensearch-dashboards opensearch/opensearch-dashboards \
+#   -n logging -f this-file.yaml
+# Access: kubectl port-forward svc/opensearch-dashboards -n logging 5601:5601
+# Then SSH tunnel: ssh -L 5601:localhost:5601 zaheer@192.168.88.130
+# ============================================================
+
+opensearchHosts: "http://opensearch-cluster-master:9200"
+
+extraEnvs:
+  # Security plugin disabled because OpenSearch has plugins.security.disabled: true
+  - name: DISABLE_SECURITY_DASHBOARDS_PLUGIN
+    value: "true"
+
+config:
+  opensearch_dashboards.yml: |
+    server.host: '0.0.0.0'
+    opensearch.hosts: [http://opensearch-cluster-master:9200]
+    opensearch.requestHeadersAllowlist: [Authorization, x-forwarded-for]
