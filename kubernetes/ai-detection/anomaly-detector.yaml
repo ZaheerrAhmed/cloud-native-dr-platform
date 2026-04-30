@@ -1,0 +1,272 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-detection
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: anomaly-detector-sa
+  namespace: ai-detection
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::380093117517:role/dr-platform-primary-drift-detection-role
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: anomaly-detector-script
+  namespace: ai-detection
+data:
+  detector.py: |
+    """
+    AI Security Anomaly Detector
+    ─────────────────────────────
+    Runs every 5 minutes, reads last 5 min of logs from OpenSearch,
+    sends to Groq Llama-3.3-70b for security analysis,
+    fires SNS alert if THREAT detected.
+
+    Detects: brute-force logins, port scans, privilege escalation,
+             crash-loop attacks, unusual external IPs, data exfiltration patterns.
+    """
+    import os, json, sys, boto3, requests, logging
+    from datetime import datetime, timezone, timedelta
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger("anomaly-detector")
+
+    GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
+    GROQ_URL       = "https://api.groq.com/openai/v1/chat/completions"
+    GROQ_MODEL     = "llama-3.3-70b-versatile"
+    OPENSEARCH_URL = os.getenv("OPENSEARCH_URL", "http://opensearch-cluster-master.logging.svc.cluster.local:9200")
+    SNS_TOPIC_ARN  = os.environ["SNS_TOPIC_ARN"]
+    AWS_REGION     = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+    LOOKBACK_MIN   = int(os.getenv("LOOKBACK_MINUTES", "5"))
+
+    SYSTEM_PROMPT = """You are a senior SOC analyst and cloud security expert.
+    Analyze the provided Kubernetes pod logs from a cloud-native DR platform for security threats.
+    Respond ONLY with valid JSON — no markdown, no extra text."""
+
+    def fetch_logs():
+        since = (datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MIN)).isoformat()
+        query = {
+            "size": 200,
+            "sort": [{"@timestamp": "desc"}],
+            "query": {
+                "bool": {
+                    "must": [{"range": {"@timestamp": {"gte": since}}}],
+                    "should": [
+                        {"match": {"log": "error"}},
+                        {"match": {"log": "fail"}},
+                        {"match": {"log": "denied"}},
+                        {"match": {"log": "unauthorized"}},
+                        {"match": {"log": "exception"}},
+                        {"match": {"log": "attack"}},
+                        {"match": {"log": "invalid"}},
+                        {"match": {"log": "refused"}},
+                        {"match": {"log": "timeout"}},
+                        {"match": {"log": "crash"}}
+                    ],
+                    "minimum_should_match": 1
+                }
+            }
+        }
+        resp = requests.post(
+            f"{OPENSEARCH_URL}/dr-platform-logs/_search",
+            json=query, timeout=15
+        )
+        resp.raise_for_status()
+        hits = resp.json().get("hits", {}).get("hits", [])
+        log.info("Fetched %d security-relevant log entries from last %d min", len(hits), LOOKBACK_MIN)
+        return hits
+
+    def build_prompt(hits):
+        entries = []
+        for h in hits[:80]:
+            s = h.get("_source", {})
+            entries.append({
+                "time": s.get("@timestamp", ""),
+                "pod": s.get("kubernetes", {}).get("pod_name", "unknown"),
+                "namespace": s.get("kubernetes", {}).get("namespace_name", "unknown"),
+                "log": str(s.get("log", ""))[:300]
+            })
+
+        return f"""Analyze these {len(entries)} Kubernetes log entries from the last {LOOKBACK_MIN} minutes.
+    Look for: brute-force attempts, failed authentication spikes, privilege escalation,
+    unusual crash patterns, data exfiltration, port scanning, injection attempts.
+
+    Return JSON with exactly these fields:
+    {{
+      "threat_level": "CRITICAL|HIGH|MEDIUM|LOW|NORMAL",
+      "confidence_pct": <0-100>,
+      "attack_type": "<type or NONE>",
+      "affected_pods": ["<pod names>"],
+      "summary": "<2 sentences: what happened and recommended action>",
+      "indicators": ["<specific log lines or patterns that triggered this>"],
+      "immediate_action": "<what to do right now or NONE>"
+    }}
+
+    Log entries:
+    {json.dumps(entries, indent=2)}"""
+
+    def call_groq(hits):
+        resp = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": build_prompt(hits)}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 1024,
+                "response_format": {"type": "json_object"}
+            },
+            timeout=30
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        return json.loads(content)
+
+    def index_to_opensearch(analysis):
+        doc = {
+            "@timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": "security_analysis",
+            "ai_model": GROQ_MODEL,
+            "threat_level": analysis.get("threat_level"),
+            "confidence_pct": analysis.get("confidence_pct"),
+            "attack_type": analysis.get("attack_type"),
+            "affected_pods": analysis.get("affected_pods", []),
+            "summary": analysis.get("summary"),
+            "indicators": analysis.get("indicators", []),
+            "immediate_action": analysis.get("immediate_action")
+        }
+        try:
+            requests.post(
+                f"{OPENSEARCH_URL}/security-analysis/_doc",
+                json=doc, timeout=10
+            )
+            log.info("Indexed security analysis to OpenSearch")
+        except Exception as e:
+            log.warning("OpenSearch indexing failed: %s", e)
+
+    def send_sns(analysis):
+        level = analysis.get("threat_level", "NORMAL")
+        if level in ("NORMAL", "LOW"):
+            log.info("No threat detected (level=%s, confidence=%s%%) — no alert",
+                     level, analysis.get("confidence_pct"))
+            return
+
+        subject = f"[SECURITY ALERT] {level} threat detected on DR Platform"
+        message = (
+            f"Threat Level:     {level} ({analysis.get('confidence_pct')}% confidence)\n"
+            f"Attack Type:      {analysis.get('attack_type', 'Unknown')}\n"
+            f"Affected Pods:    {', '.join(analysis.get('affected_pods', [])) or 'Unknown'}\n\n"
+            f"Summary:\n{analysis.get('summary', '')}\n\n"
+            f"Indicators:\n" + "\n".join(f"  - {i}" for i in analysis.get("indicators", [])) +
+            f"\n\nImmediate Action:\n{analysis.get('immediate_action', 'NONE')}\n\n"
+            f"Analyzed by: Groq {GROQ_MODEL}\n"
+            f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+        boto3.client("sns", region_name=AWS_REGION).publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject,
+            Message=message
+        )
+        log.info("SNS alert sent — threat level: %s", level)
+
+    def main():
+        log.info("=== AI Security Anomaly Detector started ===")
+        log.info("Model: %s | OpenSearch: %s | Lookback: %d min",
+                 GROQ_MODEL, OPENSEARCH_URL, LOOKBACK_MIN)
+
+        try:
+            hits = fetch_logs()
+            if not hits:
+                log.info("No security-relevant logs in last %d minutes — skipping analysis", LOOKBACK_MIN)
+                sys.exit(0)
+
+            log.info("Sending %d log entries to Groq for analysis...", len(hits))
+            analysis = call_groq(hits)
+
+            log.info("Result: threat=%s confidence=%s%% attack=%s",
+                     analysis.get("threat_level"),
+                     analysis.get("confidence_pct"),
+                     analysis.get("attack_type"))
+
+            index_to_opensearch(analysis)
+            send_sns(analysis)
+
+        except Exception as e:
+            log.error("Detector failed: %s", e, exc_info=True)
+            sys.exit(1)
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: anomaly-detector
+  namespace: ai-detection
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: anomaly-detector-sa
+          initContainers:
+            - name: install-deps
+              image: python:3.12-slim
+              command: ["pip", "install", "--quiet", "--target=/deps",
+                        "boto3==1.34.0", "requests==2.31.0"]
+              volumeMounts:
+                - name: deps
+                  mountPath: /deps
+          containers:
+            - name: detector
+              image: python:3.12-slim
+              command: ["python", "/app/detector.py"]
+              env:
+                - name: PYTHONPATH
+                  value: "/deps"
+                - name: GROQ_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: ai-secrets
+                      key: groq_api_key
+                - name: SNS_TOPIC_ARN
+                  valueFrom:
+                    secretKeyRef:
+                      name: ai-secrets
+                      key: sns_topic_arn
+                - name: OPENSEARCH_URL
+                  value: "http://opensearch-cluster-master.logging.svc.cluster.local:9200"
+                - name: AWS_DEFAULT_REGION
+                  value: "us-east-1"
+                - name: LOOKBACK_MINUTES
+                  value: "5"
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              volumeMounts:
+                - name: script
+                  mountPath: /app
+                - name: deps
+                  mountPath: /deps
+          volumes:
+            - name: script
+              configMap:
+                name: anomaly-detector-script
+            - name: deps
+              emptyDir: {}
