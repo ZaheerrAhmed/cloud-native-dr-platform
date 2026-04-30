@@ -70,6 +70,7 @@ spec:
                 secretKeyRef:
                   name: dr-secrets
                   key: opensearch_password
+                  optional: true
           volumeMounts:
             - name: analyzer-script
               mountPath: /app
@@ -115,7 +116,7 @@ data:
     # ── Config ────────────────────────────────────────────────
     GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
     GROQ_API_URL   = "https://api.groq.com/openai/v1/chat/completions"
-    GROQ_MODEL     = "llama3-70b-8192"          # free, fast, high quality
+    GROQ_MODEL     = "llama-3.3-70b-versatile"  # free, fast, high quality
 
     OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://ollama-service:11434")
     OLLAMA_MODEL   = "llama3.2"                  # fallback if no Groq key
@@ -128,7 +129,7 @@ data:
     POLL_INTERVAL  = 300   # check every 5 minutes
 
     USE_GROQ = bool(GROQ_API_KEY)
-    log.info("AI backend: %s", "Groq API (llama3-70b)" if USE_GROQ else "Ollama (llama3.2 local)")
+    log.info("AI backend: %s", "Groq API (llama-3.3-70b-versatile)" if USE_GROQ else "Ollama (llama3.2 local)")
 
     # ── Prompt (same regardless of backend) ───────────────────
     SYSTEM_PROMPT = """You are a Cloud Infrastructure Security and Compliance expert
@@ -220,7 +221,7 @@ data:
             f"• *{r['resource']}*: {r['issue']} → {r['remediation']}"
             for r in analysis.get("top_risks", [])
         ) or "No specific risks identified"
-        backend = "Groq llama3-70b" if USE_GROQ else "Ollama llama3.2"
+        backend = "Groq llama-3.3-70b-versatile" if USE_GROQ else "Ollama llama3.2"
         payload = {
             "attachments": [{
                 "color": color,
@@ -254,8 +255,7 @@ data:
         try:
             requests.post(
                 f"{OPENSEARCH_URL}/drift-reports/_doc",
-                json=doc, timeout=10,
-                auth=("admin", os.environ["OPENSEARCH_PASSWORD"])
+                json=doc, timeout=10
             )
             log.info("Indexed drift report to OpenSearch")
         except Exception as e:
@@ -283,7 +283,7 @@ data:
     # ── Main loop ─────────────────────────────────────────────
     def main():
         log.info("AI Drift Analyzer started")
-        log.info("Backend: %s", "Groq API (llama3-70b-8192)" if USE_GROQ else "Ollama local")
+        log.info("Backend: %s", "Groq API (llama-3.3-70b-versatile)" if USE_GROQ else "Ollama local")
         log.info("Polling every %ds for new drift reports at %s", POLL_INTERVAL, REPORT_PATH)
         last_mtime = None
 

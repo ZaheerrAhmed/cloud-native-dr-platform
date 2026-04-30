@@ -96,5 +96,4 @@ metadata:
   name: drift-detection-sa
   namespace: drift-detection
   annotations:
-    # Role ARN is patched by Ansible deploy-k8s-tools.yaml after Terraform outputs it
-    eks.amazonaws.com/role-arn: "PATCH_BY_ANSIBLE"
+    eks.amazonaws.com/role-arn: arn:aws:iam::380093117517:role/dr-platform-primary-drift-detection-role

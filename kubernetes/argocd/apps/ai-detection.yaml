@@ -1,0 +1,45 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ai-detection
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ZaheerrAhmed/cloud-native-dr-platform
+    targetRevision: main
+    path: kubernetes/ai-detection
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ai-detection
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: drift-detection
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ZaheerrAhmed/cloud-native-dr-platform
+    targetRevision: main
+    path: kubernetes/drift-detection
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: drift-detection
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
