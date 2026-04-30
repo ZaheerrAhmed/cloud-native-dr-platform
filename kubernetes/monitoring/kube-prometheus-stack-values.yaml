@@ -141,7 +141,7 @@ grafana:
         revision: 37
         datasource: Prometheus
       velero:
-        gnetId: 16829
+        gnetId: 11055
         revision: 2
         datasource: Prometheus
       kubernetes-views-pods:
