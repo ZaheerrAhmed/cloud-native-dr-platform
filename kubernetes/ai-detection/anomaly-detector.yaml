@@ -67,7 +67,14 @@ data:
                         {"match": {"log": "timeout"}},
                         {"match": {"log": "crash"}}
                     ],
-                    "minimum_should_match": 1
+                    "minimum_should_match": 1,
+                    "must_not": [
+                        {"match": {"log": "failed to save dashboard"}},
+                        {"match": {"log": "helm template"}},
+                        {"match": {"log": "sidecarProvider"}},
+                        {"match": {"log": "Cannot change resource manager"}},
+                        {"match": {"log": "Too Many Requests"}}
+                    ]
                 }
             }
         }
@@ -110,24 +117,32 @@ data:
     {json.dumps(entries, indent=2)}"""
 
     def call_groq(hits):
-        resp = requests.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": build_prompt(hits)}
-                ],
-                "temperature": 0.1,
-                "max_tokens": 1024,
-                "response_format": {"type": "json_object"}
-            },
-            timeout=30
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        return json.loads(content)
+        import time
+        for attempt in range(3):
+            resp = requests.post(
+                GROQ_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user",   "content": build_prompt(hits)}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 1024,
+                    "response_format": {"type": "json_object"}
+                },
+                timeout=30
+            )
+            if resp.status_code == 429:
+                wait = 30 * (attempt + 1)
+                log.warning("Groq rate limit hit (attempt %d/3) — waiting %ds", attempt+1, wait)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            return json.loads(content)
+        raise Exception("Groq rate limit exceeded after 3 attempts — will retry next CronJob cycle")
 
     def index_to_opensearch(analysis):
         doc = {
