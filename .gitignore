@@ -135,11 +135,13 @@ lambda/*.zip
 # Private — Do NOT push to GitHub
 # ============================================
 
-# Exam prep and internal documentation
+# Internal documentation
 EXAM-QNA.md
 PROJECT-DOCUMENTATION.md
 SETUP-GUIDE.md
 BEFORE-YOU-DEPLOY.md
+EXAM_CHECKLIST.md
+TESTING_GUIDE.md
 
 # Kubeconfig — contains cluster credentials
 *.kubeconfig
