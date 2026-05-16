@@ -20,42 +20,20 @@ This project implements a production-grade cloud-native disaster recovery platfo
 
 ## Architecture
 
-```
-Developer
-    │
-    │  git push
-    ▼
-GitHub Repository
-    │
-    ├── ArgoCD (GitOps sync to both clusters)
-    └── Terraform (infrastructure provisioning)
+![Cloud-Native DR Platform — Reference Architecture](docs/architecture.png)
 
-┌─────────────────────────┐         ┌─────────────────────────┐
-│   us-east-1  PRIMARY    │         │   us-west-2   DR        │
-│─────────────────────────│         │─────────────────────────│
-│  EKS Cluster (2 nodes)  │         │  EKS Cluster (1→3 nodes)│
-│  dr-status-monitor      │         │  dr-status-monitor      │
-│  Prometheus + Grafana   │         │  Prometheus + Grafana   │
-│  OpenSearch + FluentBit │         │  Velero                 │
-│  Velero                 │  WAL    │                         │
-│  ArgoCD                 │────────►│  RDS PostgreSQL 16      │
-│  OPA Gatekeeper         │  repl.  │  Read Replica           │
-│  AI Anomaly Detector    │         │  (promoted on failover) │
-│  AI Drift Analyzer      │  S3     │                         │
-│                         │  CRR   ►│  S3 Velero Bucket       │
-│  RDS PostgreSQL 16      │         │  (replicated backups)   │
-│  S3 Velero Bucket       │         │                         │
-└─────────────────────────┘         └─────────────────────────┘
-            │
-            │  Route53 health check every 20 seconds
-            │  3 failures → CloudWatch Alarm
-            │            → EventBridge Rule
-            │            → Lambda Function:
-            │                1. Promote RDS read replica
-            │                2. Scale EKS 1 → 3 nodes
-            │                3. Send SNS alert
-            │
-            └──► Route53 DNS switches to DR automatically
+A multi-region active / warm-standby topology on AWS. Route 53 health checks gate traffic between us-east-1 (primary) and us-west-2 (DR). GitOps via ArgoCD keeps both clusters in lockstep with the repository, while Velero replicates cluster state to S3 with cross-region replication. An AI layer — Llama 3.3 70B via Groq — handles anomaly detection on the OpenSearch logging pipeline and ISO 22301-aware drift analysis on driftctl reports.
+
+**Failover sequence (drill-measured: 6m 42s end-to-end)**
+
+```
+1. Route 53 health check fails 3× consecutive  (~60s detection)
+2. CloudWatch alarm → SNS → EventBridge
+3. Lambda promotes RDS read replica            (~5-8 min)
+4. Lambda scales DR EKS nodegroup 1 → 3 nodes
+5. Route 53 DNS shifts to DR load balancer
+6. ArgoCD reconciles workloads to Git HEAD
+7. SNS email to operator — service restored
 ```
 
 ---
@@ -156,7 +134,7 @@ cloud-native-dr-platform/
 ├── ansible/
 │   └── playbooks/        # Tool installation and deployment
 └── docs/
-    └── architecture.svg  # Architecture diagram
+    └── architecture.png  # Reference architecture diagram
 ```
 
 ---
