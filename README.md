@@ -2,9 +2,6 @@
 
 **with Automated Failover, Data Replication, and Business Continuity for Critical Systems**
 
-**Zaheer Ahmad** — Diploma in Artificial Intelligence Operations (EduQual Level 6)
-Al-Nafi International College
-
 ---
 
 ## Overview
